@@ -2004,3 +2004,12 @@ A real Windows dhd.exe, cross-built on Linux with xwin's MSVC libraries and run 
 `gate_native_renderer.py` before and after with the same race pictures (native and exact arms),
 and `test_native_paths.py` (window, silent movies, sharp and original font, a texture pack) gives
 the same 10 pictures before and after.
+
+Native Vulkan shader build (2026-10-25, finding 082, fork issue #14): the ordinary Linux link
+now compiles all eight native renderer entry points from shared raster.hlsl with pinned DXC,
+validates every SPIR-V module with spirv-val, and embeds the native modules with retention
+through host optimisation. Set-0 register ranges are explicit; SPIR-V-only output attributes
+preserve dual-source blending, and vertex compilation flips clip Y for positive-height Vulkan
+viewports. Descriptor/stage/embedding tests and existing i686 RADV GPU/GS/capture fixtures pass;
+exact compute binaries and preprocessed D3D11 HLSL tokens remain unchanged. Native Vulkan
+pipeline creation and picture validation remain separate work; src/ and strict checks unchanged.

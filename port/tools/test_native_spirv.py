@@ -29,9 +29,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     header = out / 'gs_spirv.h'
     generate(header)  # spirv-val is mandatory for every module.
+    # The Linux renderer does not reference native modules yet. Optimisation
+    # must still keep them in the build, ready for the native Vulkan backend.
+    obj = out / 'embedded.o'
+    subprocess.run(['clang', '-m32', '-O2', '-x', 'c', '-c', '-include', 'stdint.h',
+                    str(header), '-o', str(obj)], check=True)
+    embedded = obj.read_bytes()
     modules = {}
     for entry, stage in NATIVE_ENTRIES:
         binary = out / ('gs_spirv_%s.spv' % entry)
+        assert binary.read_bytes() in embedded, (entry, 'removed by host compiler')
         dis = subprocess.check_output(['spirv-dis', str(binary)], text=True)
         modules[entry] = dis
         bindings = dict((name, int(binding)) for name, binding in
