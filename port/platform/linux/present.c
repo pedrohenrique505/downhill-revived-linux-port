@@ -208,6 +208,84 @@ int host_keyboard_state(uint8_t down[256])
     return 1;
 }
 
+/* DHD_BENCH=first-last times the wall clock between consecutive fields of that virtual-field
+   window and prints one summary line at the last field, with each port thread's CPU time and
+   DHD_TIMELINE's waits (graphics_queue.c); DHD_BENCH_EXIT=1 then ends the process. As
+   port/gs/present.c, without the native renderer's and the sound's counters. */
+void graphics_timeline(int phase, unsigned field, double wall_seconds);
+
+static int compare_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void bench_threads(int end, unsigned fields)
+{
+    enum { MAX = 16 };
+    static const char *names[MAX];
+    static double before[MAX];
+    static unsigned count;
+    double now[MAX];
+    const char *now_names[MAX];
+    unsigned n = host_thread_cpu(now_names, now, MAX);
+    if (!end) {
+        count = n;
+        for (unsigned i = 0; i < n; i++) names[i] = now_names[i], before[i] = now[i];
+        return;
+    }
+    fprintf(stderr, "bench threads: cpu_ms_per_field");
+    for (unsigned i = 0; i < n; i++) {
+        double start = 0;
+        for (unsigned j = 0; j < count; j++) if (names[j] == now_names[i]) start = before[j];
+        fprintf(stderr, " %s=%.3f", now_names[i], (now[i] - start) * 1e3 / fields);
+    }
+    fprintf(stderr, "\n");
+}
+
+static void bench_vsync(void)
+{
+    static int state;  /* 0 unread, 1 armed, 2 done */
+    static unsigned long long first, last;
+    static double start, previous, *frames;
+    extern uint64_t kernel_vsync_count;
+    if (state == 2) return;
+    if (!state) {
+        const char *range = getenv("DHD_BENCH");
+        if (!range || sscanf(range, "%llu-%llu", &first, &last) != 2 || last <= first) { state = 2; return; }
+        frames = calloc(last - first, sizeof *frames);
+        if (!frames) { state = 2; return; }
+        state = 1;
+    }
+    unsigned long long field = kernel_vsync_count;
+    if (field < first) return;
+    double now = host_wall_seconds();
+    if (field == first) {
+        start = previous = now;
+        bench_threads(0, 0);
+        graphics_timeline(0, (unsigned)field, 0);
+        return;
+    }
+    if (field > last) { state = 2; return; }  /* started inside the window: no clean measurement */
+    frames[field - first - 1] = now - previous;
+    graphics_timeline(field < last ? 1 : 2, (unsigned)field, now - previous);
+    previous = now;
+    if (field < last) return;
+    unsigned n = (unsigned)(last - first), worst = n / 100 ? n / 100 : 1;
+    bench_threads(1, n);
+    qsort(frames, n, sizeof *frames, compare_double);
+    double tail = 0;
+    for (unsigned i = n - worst; i < n; i++) tail += frames[i];
+    fprintf(stderr, "bench: fields=%u-%llu fields_per_s=%.3f p50_ms=%.3f p99_ms=%.3f worst1pct_ms=%.3f max_ms=%.3f\n",
+            (unsigned)first, last, n / (now - start), frames[n / 2] * 1e3, frames[n * 99 / 100] * 1e3,
+            tail / worst * 1e3, frames[n - 1] * 1e3);
+    fflush(stderr);
+    free(frames);
+    state = 2;
+    const char *quit = getenv("DHD_BENCH_EXIT");
+    if (quit && !strcmp(quit, "1")) exit(0);
+}
+
 void gs_vsync(void)
 {
     static unsigned previous_bp = ~0u;
@@ -219,6 +297,7 @@ void gs_vsync(void)
             exit(1);
         }
     }
+    bench_vsync();
     if (disabled) return;
     gs_pump_messages();
     /* Plain MMIO pages are the authoritative privileged register storage. */
