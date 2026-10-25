@@ -63,9 +63,9 @@ int main(void)
     }
     /* Wait for the final handed frame, then stop/join before releasing SDL. */
     unsigned w, h; if (!gs_native_picture(&gs, &w, &h)) return 1;
-    EnterCriticalSection(&n->context_lock);
+    native_context_enter(n);
     unsigned long long frames = n->stats.frames, shown = n->stats.presented, mixed = n->stats.interp_frames;
-    LeaveCriticalSection(&n->context_lock);
+    native_context_leave(n);
     int ok = frames == 150 && shown >= 120 && (!n->interp || mixed > 10);
     fprintf(stdout, "window: frames=%llu presented=%llu interpolated=%llu %s\n", frames, shown, mixed, ok ? "PASS" : "FAIL");
     gs_gpu_destroy(&gs);

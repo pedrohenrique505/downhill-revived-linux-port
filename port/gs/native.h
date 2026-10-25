@@ -174,6 +174,7 @@ typedef struct Native {
     void (*exact_stage_pages)(Gs *g, const uint32_t want[16], uint32_t staged[16]);
     void *gpu;                       /* the backend's state */
     CRITICAL_SECTION context_lock;   /* the backend's device context: render thread, captures, settings */
+    volatile LONG context_waiters;     /* Linux: renderer yields the context to requested host operations */
     /* recording (GS worker) */
     NativeFrame frames[NATIVE_FRAMES];
     NativeFrame *recording;
@@ -262,6 +263,29 @@ typedef struct Native {
     FILE *trace_fields, *trace_pictures;
     NativeStats trace_last;
 } Native;
+
+/* A continuously presenting Linux thread can reacquire pthread's mutex ahead of
+   already-waiting uploads, captures or settings forever. Publish those requests
+   before waiting; the render thread lets them enter before starting another picture.
+   Windows keeps its existing critical-section behaviour. */
+static inline void native_context_enter(Native *n)
+{
+#ifdef __linux__
+    InterlockedIncrement(&n->context_waiters);
+#endif
+    EnterCriticalSection(&n->context_lock);
+#ifdef __linux__
+    InterlockedDecrement(&n->context_waiters);
+#endif
+}
+static inline void native_context_leave(Native *n) { LeaveCriticalSection(&n->context_lock); }
+static inline void native_context_render_enter(Native *n)
+{
+#ifdef __linux__
+    while (__atomic_load_n(&n->context_waiters, __ATOMIC_ACQUIRE)) Sleep(0);
+#endif
+    EnterCriticalSection(&n->context_lock);
+}
 
 /* Blend factors in a draw's blend_key (1 | source << 1 | destination << 6 | op << 11): GS blending
    as m * C + k, numbered as D3D11_BLEND and D3D11_BLEND_OP (op 1 add, 2 subtract, 3 reverse). */

@@ -205,11 +205,11 @@ int native_gpu_texture(Native *n, NativeTexture *t, const uint32_t *pixels, unsi
 }
 void native_gpu_texture_free(Native *n, NativeTexture *t)
 {
-    EnterCriticalSection(&n->context_lock);
+    native_context_enter(n);
     Image *i = (Image *)t->texture;
     if (i) { discard_image(n->gpu, i); free(i); }
     t->texture = NULL; t->view = NULL; t->sharp = NULL;
-    LeaveCriticalSection(&n->context_lock);
+    native_context_leave(n);
 }
 NativeView *native_gpu_pack_view(Native *n, TexPackEntry *e) { (void)n; (void)e; return NULL; }
 
@@ -473,12 +473,18 @@ int native_gpu_scanout(Native *n, NativeFrame *f)
     VkDescriptorSet set = descriptors(v, 1, d, sizeof d, images, 0);
     barrier(v); vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->scanout);
     vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(v->cmd, (d[5]+7)/8, (d[6]+7)/8, 1); barrier(v); submit(v); return 1;
+    vkCmdDispatch(v->cmd, (d[5]+7)/8, (d[6]+7)/8, 1); barrier(v);
+    /* Window scanout and presentation share a submission: don't wait for this
+       field on the CPU just to enqueue its blit into the acquired image. */
+    if (!v->surface) submit(v);
+    return 1;
 }
 int native_gpu_movie(Native *n, NativeFrame *f)
 {
     NativeVk *v = n->gpu; Image *out = display_size(n, f->movie_width, f->movie_height);
-    image_upload(v, out, f->movie, 0, 0, f->movie_width, f->movie_height); submit(v); return 1;
+    image_upload(v, out, f->movie, 0, 0, f->movie_width, f->movie_height);
+    if (!v->surface) submit(v);
+    return 1;
 }
 int native_gpu_read(Native *n, uint32_t *pixels)
 {
@@ -586,12 +592,12 @@ int native_gpu_present(Native *n)
 {
     NativeVk *v = n->gpu;
     if (!v->surface || !v->display.image) return 0;
-    if (!swapchain_create(n)) { Sleep(10); return 0; }
+    if (!swapchain_create(n)) { submit(v); Sleep(10); return 0; }
     begin(v); /* retires the previous submission before reusing the acquire semaphore */
     uint32_t index;
     VkResult r = vkAcquireNextImageKHR(v->device, v->swapchain, 100000000, v->acquired, VK_NULL_HANDLE, &index);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { v->recreate = 1; return 0; }
-    if (r == VK_TIMEOUT || r == VK_NOT_READY) return 0;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { v->recreate = 1; submit(v); return 0; }
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) { submit(v); return 0; }
     if (r != VK_SUBOPTIMAL_KHR) vk_require(r, "vkAcquireNextImageKHR");
     else v->recreate = 1;
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};

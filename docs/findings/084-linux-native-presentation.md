@@ -66,3 +66,37 @@ and timeline successfully. Actual window and internal pictures inspected after
 resize. Its GDB observer stops every field and reports only 56.54 fields/s at
 6000-6600; this is retained as an instrumented result, not a 60-Hz performance
 claim. Full-race completion and unpaused 120/144 Hz checks are still running.
+
+## Live-race harness and context fairness
+
+The first 60-Hz race reaches the real finish flag at official tick 23551
+(392.5167 seconds), matching the prior full-pedal fixture. Its GDB callback then
+stalls on an inferior function call; all game threads are ptrace-stopped. The
+closing portion is invalid and that own test group was stopped. The replacement
+observer reads only its child's `/proc/PID/mem`, without stopping any thread.
+
+The replacement's 60-Hz bounded run exercises real resize, screenshots, DHD_DUMP,
+benchmark and timeline. It closes cleanly with exit 0 on WM_DELETE_WINDOW.
+The compositor ignores xdotool's root-window `_NET_CLOSE_WINDOW` request; the
+harness now sends the standard WM_PROTOCOLS/WM_DELETE_WINDOW client message to
+its own verified application window. Protocol/layout references: installed
+Xlib.h and SDL_x11events.c, and
+[xdotool's request implementation](https://github.com/jordansissel/xdotool/blob/master/xdo.c).
+No external implementation copied. Raw evidence: `race60/`, `race60-unpaused/`.
+Unpaused benchmark: 57.136 fields/s, 57.15 pictures/s at fields 6000-6600.
+
+An added display-vsync interpolation fixture (DHD_INTERP=1 without an explicit
+rate) times out before the fairness fix. GDB stacks show the main thread inside
+gs_native_present_options/pthread_mutex_lock while the render thread repeatedly
+presents under the context lock. The first live 120-Hz run also stalls logical
+progress while continuing to present: 3459 fields versus 38085 pictures. It was
+closed and is not full-race acceptance.
+
+Linux context clients now publish requests before waiting; the render thread
+lets those requests acquire the mutex before starting another picture. Windows
+retains its original lock behaviour. All four window modes pass the unchanged
+API/synchronization checks after this fix, including the previously timed-out
+vsync case. Scanout and presentation additionally share one submission on a
+window, removing a CPU fence wait for the current field; skipped presentations
+still submit the field's work. Offscreen submissions are unchanged.
+Evidence: `issue16-vsync-stacks.log`, `window-fair/`, `window-submit/`.

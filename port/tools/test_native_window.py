@@ -25,10 +25,12 @@ def main():
     base = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
     if args.validation:
         base.update(DHD_VK_VALIDATE='1', VK_LAYER_VALIDATE_SYNC='1')
-    for hz in (60, 120, 144):
+    for hz in (60, 120, 144, 0):
         env = dict(base, DHD_SCALE='window')
         if hz != 60:
-            env.update(DHD_INTERP='1', DHD_INTERP_HZ=str(hz))
+            env['DHD_INTERP'] = '1'
+            if hz:
+                env['DHD_INTERP_HZ'] = str(hz)
         run = subprocess.run([str(exe)], env=env, capture_output=True, text=True, timeout=45)
         log = run.stdout + run.stderr
         (out / f'{hz}.log').write_text(log)

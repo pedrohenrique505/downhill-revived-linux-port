@@ -1579,7 +1579,7 @@ static void native_interp_thread(Native *n)
         if (fresh && mix) native_pair(n, a, b);
         float t = mix ? (float)((now - b->time) / period) : 1;
         if (t < 0) t = 0;
-        EnterCriticalSection(&n->context_lock);
+        native_context_render_enter(n);
         /* Experiments (DHD_INTERP_MODE): once = each field drawn once, at the first picture;
            drawn = each picture scanned out from the frame buffer the field drew into. */
         static int mode = -1;
@@ -1594,7 +1594,7 @@ static void native_interp_thread(Native *n)
         else native_picture(n, b, b->vertices, 1);
         b->display_surface = shown;
         native_dump_picture(n, b, t < 1 ? t : 1);
-        LeaveCriticalSection(&n->context_lock);
+        native_context_leave(n);
         if (fresh) {
             EnterCriticalSection(&n->queue_lock);
             n->rendered = b->field;
@@ -1626,10 +1626,10 @@ static unsigned __stdcall native_thread(void *argument)
         WakeAllConditionVariable(&n->queue_changed);
         LeaveCriticalSection(&n->queue_lock);
         native_gpu_wait(n);
-        EnterCriticalSection(&n->context_lock);
+        native_context_render_enter(n);
         n->present_due = f->due, n->present_began = f->began;
         native_picture(n, f, f->vertices, 1);
-        LeaveCriticalSection(&n->context_lock);
+        native_context_leave(n);
         native_recycle(f);
         EnterCriticalSection(&n->queue_lock);
         n->free_frames[n->free_count++] = f;
@@ -1646,16 +1646,16 @@ static unsigned __stdcall native_thread(void *argument)
 void gs_native_lock(Gs *g, int lock)
 {
     Native *n = native_of(g);
-    if (lock) EnterCriticalSection(&n->context_lock);
-    else LeaveCriticalSection(&n->context_lock);
+    if (lock) native_context_enter(n);
+    else native_context_leave(n);
 }
 
 void gs_native_present_options(Gs *g)
 {
     Native *n = native_of(g);
-    EnterCriticalSection(&n->context_lock);
+    native_context_enter(n);
     native_present_options(n);
-    LeaveCriticalSection(&n->context_lock);
+    native_context_leave(n);
 }
 
 int gs_gpu_native(const Gs *g)
@@ -1758,7 +1758,7 @@ static int native_picture_read(Native *n, unsigned *width, unsigned *height)
     EnterCriticalSection(&n->queue_lock);
     while (n->rendered < n->handed) SleepConditionVariableCS(&n->queue_changed, &n->queue_lock, INFINITE);
     LeaveCriticalSection(&n->queue_lock);
-    EnterCriticalSection(&n->context_lock);
+    native_context_enter(n);
     size_t size = (size_t)n->display_width * n->display_height;
     int ok = n->display_width != 0;
     if (ok && size > n->picture_size) {
@@ -1768,7 +1768,7 @@ static int native_picture_read(Native *n, unsigned *width, unsigned *height)
     }
     if (ok) ok = native_gpu_read(n, n->picture);
     if (ok) { *width = n->display_width; *height = n->display_height; }
-    LeaveCriticalSection(&n->context_lock);
+    native_context_leave(n);
     return ok;
 }
 
@@ -1870,7 +1870,7 @@ void gs_native_bench(Gs *g, int end)
 {
     if (!gs_gpu_native(g)) return;
     Native *n = native_of(g);
-    EnterCriticalSection(&n->context_lock);
+    native_context_enter(n);
     if (!end) {
         n->interval_count = 0; n->last_present = 0;
         n->bench_presented = n->stats.presented; n->bench_interp = n->stats.interp_frames;
@@ -1878,7 +1878,7 @@ void gs_native_bench(Gs *g, int end)
     } else {
         native_intervals(n, "bench interp", n->stats.presented - n->bench_presented, n->stats.interp_frames - n->bench_interp);
     }
-    LeaveCriticalSection(&n->context_lock);
+    native_context_leave(n);
 }
 
 void native_profile(Native *n)
