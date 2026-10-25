@@ -25,6 +25,10 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 /* The game's code and the port's: [__executable_start, etext) (the linker defines both). */
 extern char __executable_start[], etext[];
 
@@ -372,12 +376,29 @@ void *host_fiber_main(void)
     return f;
 }
 
+/* The game keeps the stack address of a local as a PS2 address: func_002195F0 and func_0019CB08
+   build an image packet in a local array and pass it to sceGsExecLoadImage, whose DMA takes it
+   ANDed with 0x0FFFFFFF. That is the same address only below 0x10000000, where Windows happens to
+   put fiber stacks; Linux's mmap gives 0xE0000000 and up, and the GIF transfer then reads unmapped
+   memory. Fiber stacks go between the PS2 RAM view (PS2_RAM_BASE + 32 MB) and 0x10000000. */
+static char *low_stack(size_t size)
+{
+    char *stack = MAP_FAILED;
+    /* first fit, so the stacks of deleted fibers are used again */
+    for (uintptr_t at = PS2_RAM_BASE + PS2_RAM_SIZE; at + size <= 0x10000000 && stack == MAP_FAILED; at += size) {
+        stack = mmap((void *)at, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_FIXED_NOREPLACE, -1, 0);
+        if (stack != MAP_FAILED && stack != (char *)at) munmap(stack, size), stack = MAP_FAILED;
+    }
+    if (stack == MAP_FAILED) fprintf(stderr, "host: no stack below 0x10000000 for a fiber\n");
+    return stack;
+}
+
 void *host_fiber_create(void (*fn)(void *), void *arg)
 {
     Fiber *f = calloc(1, sizeof *f);
     if (!f) return NULL;
     f->size = FIBER_STACK + 4096;
-    f->stack = mmap(NULL, f->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    f->stack = low_stack(f->size);
     if (f->stack == MAP_FAILED) {
         free(f);
         return NULL;
