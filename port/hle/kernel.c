@@ -1142,6 +1142,9 @@ void kernel_init(void)
         hle_log("Cannot initialize the Vulkan exact renderer (details above).\n");
         exit(1);
     }
+    if (!gs_linux_present_init()) {
+        hle_log("Cannot initialize the Linux presentation backend (details above).\n"); exit(1);
+    }
 #endif
     ps2_mmio_write = dma_mmio_write;
     ps2_intc_read = intc_read;

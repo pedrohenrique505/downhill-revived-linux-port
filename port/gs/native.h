@@ -284,6 +284,14 @@ void native_page_inverse(uint32_t inverse[4096]);  /* raster.hlsl's page-word-to
 int native_capture(Native *n, uint32_t *pixels);   /* gs_gpu_capture */
 void native_profile(Native *n);                    /* gs_gpu_profile, and at exit */
 
+/* Host presentation and diagnostics, shared by Windows and Linux. */
+int gs_gpu_native(const Gs *g);
+void gs_native_lock(Gs *g, int lock);
+void gs_native_present_options(Gs *g);
+void gs_native_bench(Gs *g, int end);
+uint32_t *gs_native_picture(Gs *g, unsigned *width, unsigned *height);
+void gs_native_movie(Gs *g, const uint32_t *rgba, unsigned width, unsigned height);
+
 /* ---- the backend (gpu_native.inc: Direct3D 11) ---- */
 
 /* GS worker. A decoded texture (w x h RGBA) as t's image and view; with sharp, also the sharp

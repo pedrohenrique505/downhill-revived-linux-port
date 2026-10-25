@@ -33,7 +33,7 @@ typedef struct {
     VkSwapchainKHR swapchain;
     VkImage *backbuffers;
     VkSemaphore *finished, acquired;
-    unsigned image_count, family, width, height;
+    unsigned image_count, family, width, height, requested_width, requested_height;
     unsigned window_width, window_height; /* published by the SDL/window thread */
     VkPresentModeKHR present_mode;
     int recreate, point;
@@ -523,7 +523,7 @@ static int swapchain_create(Native *n)
     unsigned w = __atomic_load_n(&v->window_width, __ATOMIC_ACQUIRE);
     unsigned h = __atomic_load_n(&v->window_height, __ATOMIC_ACQUIRE);
     if (!w || !h) return 0;
-    if (v->swapchain && !v->recreate && w == v->width && h == v->height) return 1;
+    if (v->swapchain && !v->recreate && w == v->requested_width && h == v->requested_height) return 1;
     submit(v); retire(v); swapchain_free(v);
     VkSurfaceCapabilitiesKHR caps;
     VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(v->physical, v->surface, &caps));
@@ -576,7 +576,7 @@ static int swapchain_create(Native *n)
     VK_CALL(vkGetSwapchainImagesKHR(v->device, v->swapchain, &v->image_count, v->backbuffers));
     VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (unsigned i = 0; i < v->image_count; i++) VK_CALL(vkCreateSemaphore(v->device, &sem, NULL, &v->finished[i]));
-    v->width = w; v->height = h; v->recreate = 0;
+    v->requested_width = w; v->requested_height = h; v->recreate = 0;
     /* Actual surface extent can differ from the last SDL event during resize. */
     v->width = extent.width; v->height = extent.height;
     fprintf(stderr, "gs native Vulkan: swapchain %ux%u mode=%u images=%u\n", v->width, v->height, v->present_mode, v->image_count);
@@ -585,7 +585,8 @@ static int swapchain_create(Native *n)
 int native_gpu_present(Native *n)
 {
     NativeVk *v = n->gpu;
-    if (!v->surface || !v->display.image || !swapchain_create(n)) return 0;
+    if (!v->surface || !v->display.image) return 0;
+    if (!swapchain_create(n)) { Sleep(10); return 0; }
     begin(v); /* retires the previous submission before reusing the acquire semaphore */
     uint32_t index;
     VkResult r = vkAcquireNextImageKHR(v->device, v->swapchain, 100000000, v->acquired, VK_NULL_HANDLE, &index);
@@ -598,7 +599,7 @@ int native_gpu_present(Native *n)
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = v->backbuffers[index], .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     VkClearColorValue black = {.float32 = {0,0,0,1}};
     vkCmdClearColorImage(v->cmd, b.image, b.newLayout, &black, 1, &range); barrier(v);
     float fw, fh; native_viewport(n, v->width, v->height, &fw, &fh);

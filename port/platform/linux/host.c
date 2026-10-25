@@ -126,7 +126,16 @@ void host_safe_vprint(FILE *f, const char *fmt, va_list ap)
     }
 }
 
-void host_poll_dump(void) {}
+static double dump_due;
+/* The EE's next kernel boundary supplies a coherent fiber/kernel snapshot. */
+void host_poll_dump(void)
+{
+    if (!dump_due || host_wall_seconds() < dump_due) return;
+    dump_due = 0;
+    fprintf(stderr, "dump: EE at kernel boundary\n");
+    host_backtrace();
+    kernel_dump();
+}
 
 /* ---------------- named threads ---------------- */
 
@@ -170,8 +179,11 @@ void host_init(void)
     static const int fatal[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE};
     for (unsigned i = 0; i < sizeof fatal / sizeof *fatal; i++) sigaction(fatal[i], &sa, NULL);
     host_thread_name("game");
-    if (getenv("DHD_DUMP") || getenv("DHD_PROFILE") || getenv("DHD_WATCH"))
-        fprintf(stderr, "DHD_DUMP, DHD_PROFILE and DHD_WATCH are not available on Linux yet\n");
+    const char *dump = getenv("DHD_DUMP");
+    double delay = dump ? atof(dump) : 0;
+    if (delay > 0) dump_due = host_wall_seconds() + delay;
+    if (getenv("DHD_PROFILE") || getenv("DHD_WATCH"))
+        fprintf(stderr, "DHD_PROFILE and DHD_WATCH are not available on Linux yet\n");
 }
 
 /* The log goes to stderr as it is (a terminal, or the starter's file or pipe). First thing at

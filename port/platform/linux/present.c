@@ -1,12 +1,5 @@
-/* port/gs/present.c on Linux: the SDL3 window and GS framebuffer scanout.
-
-   gs.c decodes GIF packets and transfers; gs_display decodes the selected display circuit into
-   RGBA8, and SDL's Vulkan renderer scales it into the window at 4:3. The Vulkan
-   compute backend (gpu.c), installed before the game starts, rasterizes into
-   coherent GS VRAM. Scanout and captures synchronize through gs_display.
-   Frame pacing is the kernel's
-   (pacing_handed/pacing_present), as on Windows. The window's events are handled on the game thread,
-   once a field: SDL wants them on the thread that made the window. */
+/* SDL window/input belong to the EE thread. The native renderer owns Vulkan
+   presentation on its render thread; exact uses SDL's Vulkan renderer. */
 #include <SDL3/SDL.h>
 #include "sdl_events.h"
 
@@ -16,6 +9,8 @@
 
 #include "present.h"
 #include "gpu.h"
+#include "native_gpu.h"
+#include "../../gs/gpu.h"
 #include "capture.h"
 #include "../hle/hle.h"
 #include "../hle/text_input.h"
@@ -29,20 +24,22 @@ static SDL_Texture *texture;
 static unsigned texture_width, texture_height;
 static uint32_t pixels[1024 * 1024];
 static int initialized, disabled, text_on;
+static int native_selected;
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
 
 /* CPU scanout of synchronized Vulkan VRAM; capture.c uses gs_display. */
 int gs_gpu_display(Gs *g, unsigned *width, unsigned *height)
 {
-    (void)g, (void)width, (void)height;
-    return 0;
+    if (!gs_gpu_native(g)) return 0;
+    unsigned w, h;
+    if (!gs_native_picture(g, &w, &h) || (size_t)w*h > 1024*1024) return 0;
+    *width = w; *height = h; return 1;
 }
 
 int gs_gpu_capture(Gs *g, uint32_t *out)
 {
-    (void)g, (void)out;
-    return 0;
+    return gs_gpu_native(g) && native_capture(native_of(g), out);
 }
 
 static void window_size(int *w, int *h)
@@ -70,7 +67,20 @@ void gs_window_apply(void)
     }
 }
 
-void gs_present_options_apply(void) {}  /* the picture's filter and shape: the native renderer's */
+void gs_present_options_apply(void)
+{
+    if (gs_gpu_native(&gs)) gs_native_present_options(&gs);
+}
+
+static void shutdown(void)
+{
+    gs_gpu_destroy(&gs); /* joins native presentation before the SDL window disappears */
+    if (texture) SDL_DestroyTexture(texture);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+    texture = NULL; renderer = NULL; window = NULL;
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
 
 static int init(void)
 {
@@ -80,10 +90,16 @@ static int init(void)
     }
     int w, h;
     window_size(&w, &h);
-    window = SDL_CreateWindow("Downhill Revived", w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    window = SDL_CreateWindow("Downhill Revived", w, h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (native_selected ? SDL_WINDOW_VULKAN : 0));
     if (!window) {
         fprintf(stderr, "gs: no window: %s\n", SDL_GetError());
         return 0;
+    }
+    gs_window_apply();
+    if (native_selected) {
+        if (!gs_vulkan_native_window(&gs, window)) return 0;
+        hle_log("gs: SDL %s native Vulkan window\n", SDL_GetCurrentVideoDriver());
+        return 1;
     }
     renderer = SDL_CreateRenderer(window, "vulkan");
     if (!renderer) {
@@ -94,6 +110,27 @@ static int init(void)
     hle_log("gs: SDL %s window, %s renderer\n", SDL_GetCurrentVideoDriver(), SDL_GetRendererName(renderer));
     gs_window_apply();
     return 1;
+}
+
+/* kernel_init calls this after the exact Z backend and before any game packets. */
+int gs_linux_present_init(void)
+{
+    if (initialized) return 1;
+    initialized = 1;
+    disabled = getenv("DHD_HEADLESS") != NULL;
+    const char *render = getenv("DHD_RENDER");
+    native_selected = render && !strcmp(render, "native");
+    atexit(shutdown); /* graphics_queue registers later and drains first */
+    if (disabled) return !native_selected || gs_vulkan_native(&gs);
+    return init();
+}
+
+static void publish_size(void)
+{
+    if (!window || !gs_gpu_native(&gs)) return;
+    int w = 0, h = 0;
+    if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) SDL_GetWindowSizeInPixels(window, &w, &h);
+    native_vulkan_window_size(native_of(&gs), w > 0 ? (unsigned)w : 0, h > 0 ? (unsigned)h : 0);
 }
 
 static int resize(unsigned width, unsigned height)
@@ -186,6 +223,7 @@ void gs_pump_messages(void)
             break;
         }
     }
+    publish_size();
 }
 
 /* The keyboard by Windows virtual-key code, for port/platform/linux/host.c (keyboard.c's keys:
@@ -243,6 +281,91 @@ static void bench_threads(int end, unsigned fields)
     fprintf(stderr, "\n");
 }
 
+static int grab(int gpu_frame, const uint32_t **image, unsigned *width, unsigned *height)
+{
+    if (gs_gpu_native(&gs)) return (*image = gs_native_picture(&gs, width, height)) != NULL;
+    *image = pixels;
+    return !gpu_frame || gs_gpu_capture(&gs, pixels);
+}
+
+static void capture(unsigned width, unsigned height, int gpu_frame)
+{
+    const uint32_t *image = pixels;
+    static unsigned saved;
+    const char *path = getenv("DHD_SCREENSHOT"), *at = getenv("DHD_CAPTURE_AT");
+    const char *every = getenv("DHD_CAPTURE_INTERVAL");
+    const char *frame_at = getenv("DHD_CAPTURE_FRAME");
+    extern uint64_t kernel_vsync_count;
+    double capture_time = frame_at ? (double)kernel_vsync_count : host_seconds();
+    if (frame_at) {
+        at = frame_at;
+        every = getenv("DHD_CAPTURE_FRAME_INTERVAL");
+    }
+    double interval = every ? atof(every) : 0;
+    char numbered[1024];
+    race_sync_vsync(kernel_vsync_count);
+    /* DHD_CAPTURE_FIELDS=first-last[,first-last...]: every field of those windows, PATH-fNNNNNN.bmp. */
+    const char *fields = getenv("DHD_CAPTURE_FIELDS");
+    if (path && fields) {
+        unsigned long long first, last;
+        int hit = 0;
+        for (const char *s = fields; s && sscanf(s, "%llu-%llu", &first, &last) == 2; s = strchr(s, ','), s = s ? s + 1 : s)
+            hit |= kernel_vsync_count >= first && kernel_vsync_count <= last;
+        if (!hit || !grab(gpu_frame, &image, &width, &height)) return;
+        snprintf(numbered, sizeof numbered, "%s-f%06llu.bmp", path, (unsigned long long)kernel_vsync_count);
+        path = numbered;
+    } else if (getenv("DHD_RACE_SYNC")) {
+        if (!path) return;
+        if (!race_sync_capture(path, numbered, sizeof numbered)) {
+            /* Survey-only periodic pictures alongside the named race windows.
+               DHD_CAPTURE_FRAME is otherwise intentionally ignored in race
+               mode. Named consecutive captures always have priority. */
+            const char *period = getenv("DHD_RACE_CAPTURE_INTERVAL");
+            if (!period || strtoul(period, NULL, 10) == 0) return;
+            static unsigned long long next;
+            unsigned long long step = strtoul(period, NULL, 10);
+            const char *first = getenv("DHD_RACE_CAPTURE_FROM");
+            if (!next) next = first ? strtoull(first, NULL, 10) : step;
+            if (kernel_vsync_count < next) return;
+            next = (kernel_vsync_count / step + 1) * step;
+            snprintf(numbered, sizeof numbered, "%s-f%06llu.bmp", path, (unsigned long long)kernel_vsync_count);
+        }
+        if (!grab(gpu_frame, &image, &width, &height)) return;
+        path = numbered;
+    } else {
+        if (!path || (saved && interval <= 0) ||
+            capture_time < (at ? atof(at) : 10.0) + saved * interval) return;
+        if (!grab(gpu_frame, &image, &width, &height)) return;
+        if (interval > 0) {
+            snprintf(numbered, sizeof numbered, "%s-%03u.bmp", path, saved);
+            path = numbered;
+        }
+        saved++;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "gs: cannot save screenshot %s\n", path); return; }
+    BITMAPFILEHEADER file = {0};
+    BITMAPINFOHEADER info = {0};
+    file.bfType = 0x4D42; file.bfOffBits = sizeof file + sizeof info;
+    file.bfSize = file.bfOffBits + width * height * 4;
+    info.biSize = sizeof info; info.biWidth = width; info.biHeight = -(LONG)height;
+    info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+    fwrite(&file, sizeof file, 1, f); fwrite(&info, sizeof info, 1, f);
+    for (unsigned i = 0; i < width * height; i++) {
+        uint32_t v = image[i], bgra = (v & 0xFF00FF00) | (v & 255) << 16 | (v >> 16 & 255);
+        fwrite(&bgra, 4, 1, f);
+    }
+    fclose(f);
+    fprintf(stderr, "compare: capture %s field=%llu host=%.6f game=%.6f\n", path,
+            (unsigned long long)kernel_vsync_count, host_wall_seconds(), host_seconds());
+    hle_log("gs: saved %s (%llu PATH1 / %llu PATH2 / %llu PATH3 packets, %llu kicks, %llu uploads)\n",
+            path, gs.packets[0], gs.packets[1], gs.packets[2], gs.kicks, gs.uploads);
+    hle_log("gs: PMODE=%llX SMODE2=%llX DISPFB1=%llX DISPLAY1=%llX DISPFB2=%llX DISPLAY2=%llX\n",
+            gs_priv_read(&gs, GS_PMODE), gs_priv_read(&gs, GS_SMODE2),
+            gs_priv_read(&gs, GS_DISPFB1), gs_priv_read(&gs, GS_DISPLAY1),
+            gs_priv_read(&gs, GS_DISPFB2), gs_priv_read(&gs, GS_DISPLAY2));
+}
+
 static void bench_vsync(void)
 {
     static int state;  /* 0 unread, 1 armed, 2 done */
@@ -263,6 +386,7 @@ static void bench_vsync(void)
     if (field == first) {
         start = previous = now;
         bench_threads(0, 0);
+        gs_native_bench(&gs, 0);
         graphics_timeline(0, (unsigned)field, 0);
         return;
     }
@@ -272,6 +396,7 @@ static void bench_vsync(void)
     previous = now;
     if (field < last) return;
     unsigned n = (unsigned)(last - first), worst = n / 100 ? n / 100 : 1;
+    gs_native_bench(&gs, 1);
     bench_threads(1, n);
     qsort(frames, n, sizeof *frames, compare_double);
     double tail = 0;
@@ -289,16 +414,11 @@ static void bench_vsync(void)
 void gs_vsync(void)
 {
     static unsigned previous_bp = ~0u;
-    if (!initialized) {
-        initialized = 1;
-        disabled = getenv("DHD_HEADLESS") != NULL;
-        if (!disabled && !init()) {
-            fprintf(stderr, "Downhill Revived couldn't start its graphics (details above).\n");
-            exit(1);
-        }
+    if (!initialized && !gs_linux_present_init()) {
+        fprintf(stderr, "Downhill Revived couldn't start its graphics (details above).\n"); exit(1);
     }
     bench_vsync();
-    if (disabled) return;
+    if (disabled && !native_selected) return;
     gs_pump_messages();
     /* Plain MMIO pages are the authoritative privileged register storage. */
     for (unsigned addr = 0; addr <= 0xE0; addr += 16)
@@ -310,20 +430,25 @@ void gs_vsync(void)
     /* While a movie plays (port/hle/movie.c) its picture is shown instead. */
     unsigned movie_width, movie_height;
     const uint32_t *movie = movie_picture(&movie_width, &movie_height);
-    if (movie) {
-        width = movie_width, height = movie_height;
-        memcpy(pixels, movie, (size_t)width * height * 4);
-    } else if (!gs_display(&gs, pixels, &width, &height)) {
-        memset(pixels, 0, (size_t)width * height * 4);
+    if (gs_gpu_native(&gs)) {
+        gs_native_movie(&gs, movie, movie ? movie_width : 0, movie ? movie_height : 0);
+        native_vsync(&gs, window, &width, &height, 0);
+    } else {
+        if (movie) {
+            width = movie_width, height = movie_height;
+            memcpy(pixels, movie, (size_t)width * height * 4);
+        } else if (!gs_display(&gs, pixels, &width, &height)) {
+            memset(pixels, 0, (size_t)width * height * 4);
+        }
+        if (!resize(width, height)) return;
+        SDL_UpdateTexture(texture, NULL, pixels, (int)width * 4);
+        double due, began;
+        pacing_handed(&due, &began);
+        pacing_present(due, began);
+        present();
     }
-    if (!resize(width, height)) return;
-    SDL_UpdateTexture(texture, NULL, pixels, (int)width * 4);
-    double due, began;
-    pacing_handed(&due, &began);
-    pacing_present(due, began);
-    present();
+    capture(width, height, 0);
     extern uint64_t kernel_vsync_count;
-    race_sync_vsync(kernel_vsync_count);
     if (getenv("DHD_RACE_SYNC") && getenv("DHD_RACE_GSDUMP")) {
         char name[1024];
         /* The shared race-clock scheduler requests the GS dump as on Windows.

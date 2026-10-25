@@ -28,3 +28,23 @@ Offscreen transfer/backend fixtures: 17 PASS with the local i686 Khronos API and
 synchronization validation layer (zero validation messages). Evidence:
 `/tmp/issue16-test-validation.log`. Sandbox execution hits driver SIGSYS, so GPU
 checks run outside the sandbox. Window integration and acceptance remain pending.
+
+## Step 2: shared frontend and SDL integration
+
+Linux now selects native before any game packet is recorded, retains exact for
+Z probes, and hands fields/movies to the existing native render thread. Settings,
+scaled screenshots, race-clock/field captures and native benchmark counters use
+the shared frontend. Window events stay on the EE thread. The graphics worker
+shuts down before the renderer; presentation joins before destroying the window.
+DHD_DUMP requests an EE/kernel snapshot at the next safe kernel boundary (it does
+not suspend an arbitrarily hung instruction).
+
+Synthetic SDL window tests pass for ordinary 60 Hz fields and 120/144 Hz timed
+interpolation, including movie readback, point/aspect options, minimize/restore,
+resize and teardown. First validation run caught an acquire-to-layout-transition
+hazard: the transition's source stage now includes TRANSFER, matching the acquire
+semaphore wait. The unchanged strict validation check then passes every mode
+with zero warnings/errors. Results: 150 game fields each, 150/283/344 presented
+pictures, 0/267/324 interpolated pictures. Rendered totals can advance by one
+before shutdown. Evidence: `build/port/issue16/window/`. These are synthetic
+pictures, not full-race acceptance. Ordinary game link/live checks are pending.
