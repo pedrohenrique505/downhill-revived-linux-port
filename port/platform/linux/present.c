@@ -28,13 +28,11 @@ static int native_selected;
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
 
-/* CPU scanout of synchronized Vulkan VRAM; capture.c uses gs_display. */
+/* Exact captures use synchronized VRAM; native captures use the completed scaled picture. */
 int gs_gpu_display(Gs *g, unsigned *width, unsigned *height)
 {
     if (!gs_gpu_native(g)) return 0;
-    unsigned w, h;
-    if (!gs_native_picture(g, &w, &h) || (size_t)w*h > 1024*1024) return 0;
-    *width = w; *height = h; return 1;
+    return native_capture_display(native_of(g), width, height);
 }
 
 int gs_gpu_capture(Gs *g, uint32_t *out)
@@ -108,7 +106,6 @@ static int init(void)
     }
     SDL_SetRenderVSync(renderer, 0);  /* the kernel paces the fields */
     hle_log("gs: SDL %s window, %s renderer\n", SDL_GetCurrentVideoDriver(), SDL_GetRendererName(renderer));
-    gs_window_apply();
     return 1;
 }
 

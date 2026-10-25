@@ -1772,6 +1772,13 @@ static int native_picture_read(Native *n, unsigned *width, unsigned *height)
     return ok;
 }
 
+/* Capture's display query uses the raw picture size, independently of the optional
+   DHD_SCREENSHOT_WINDOW formatting applied by gs_native_picture. */
+int native_capture_display(Native *n, unsigned *width, unsigned *height)
+{
+    return native_picture_read(n, width, height) && (size_t)*width * *height <= 1024 * 1024;
+}
+
 /* gs_gpu_capture: the picture into a 1x-sized buffer (pixels[] in present.c), so only when it fits. */
 int native_capture(Native *n, uint32_t *pixels)
 {

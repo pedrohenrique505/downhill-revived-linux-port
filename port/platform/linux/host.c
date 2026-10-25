@@ -1,7 +1,7 @@
 /* port/hle/host.c on Linux: the host side of the native PS2 system (hle.h). The settings, the disc
    check and the pad scripts are the same as there; fibers, time, the crash report and the disc
-   chooser are POSIX. The Windows diagnostics that suspend the game thread (DHD_DUMP, DHD_PROFILE,
-   DHD_WATCH) are not available here yet. */
+   chooser are POSIX. DHD_DUMP prints at a safe EE boundary; Windows sampling
+   (DHD_PROFILE) and hardware watchpoints (DHD_WATCH) are not available here yet. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

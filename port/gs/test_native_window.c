@@ -47,6 +47,16 @@ int main(void)
             if (!picture || (field == 110 && (width != 32 || height != 24 || picture[0] != movie[0]))) {
                 fprintf(stderr, "FAIL: native movie/readback\n"); return 1;
             }
+            if (field == 110) {
+                /* Screenshot formatting must not change capture.c's raw display dimensions. */
+                setenv("DHD_SCREENSHOT_WINDOW", "320x200", 1);
+                picture = gs_native_picture(&gs, &width, &height);
+                if (!picture || width != 320 || height != 200) return 1;
+                uint32_t raw[32*24];
+                if (!native_capture_display(n, &width, &height) || width != 32 || height != 24 ||
+                    !native_capture(n, raw) || raw[0] != movie[0]) return 1;
+                unsetenv("DHD_SCREENSHOT_WINDOW");
+            }
         }
         double due = start + (field+1)/60.0;
         while (host_wall_seconds() < due) SDL_Delay(1);

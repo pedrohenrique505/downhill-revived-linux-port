@@ -1,7 +1,7 @@
 /* Vulkan graphics backend for native.c. The exact Z-probe backend has its own device/queue:
    native submission never drains exact work. Images and immutable descriptor/uniform slices
    live until the native fence completes. Positive-height viewports pair with DXC's invert-y.
-   Offscreen scanout/readback are supported here; window presentation belongs to the host. */
+   SDL creates the window on the EE thread; native_thread owns its swapchain. */
 #include "native_gpu.h"
 #include "../../gs/present.h"
 void pacing_present(double due, double began);
@@ -722,6 +722,7 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
             PFN_vkDestroyDebugUtilsMessengerEXT destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkDestroyDebugUtilsMessengerEXT");
             destroy(v->instance, v->debug, NULL);
         }
+        if (v->surface) vkDestroySurfaceKHR(v->instance, v->surface, NULL);
         vkDestroyInstance(v->instance, NULL); free(v); native_destroy(n); return 0;
     }
     v->family = family;
@@ -802,7 +803,7 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
         int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); native_vulkan_window_size(n, w, h);
     }
     native_present_options(n); native_start(g, n, (NativeHost *)g->backend);
-    fprintf(stderr, "gs: Vulkan native offscreen renderer: %s\n", properties.deviceName); return 1;
+    fprintf(stderr, "gs: Vulkan native %s renderer: %s\n", v->surface ? "window" : "offscreen", properties.deviceName); return 1;
 }
 int gs_vulkan_native(Gs *g) { return gs_vulkan_native_window(g, NULL); }
 

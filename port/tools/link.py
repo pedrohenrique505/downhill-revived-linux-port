@@ -28,8 +28,8 @@ LINUX = PLATFORM == 'linux'
 # others come from its <windows.h>, included before them with the MSVC C runtime's names.
 LINUX_FILES = {'runtime/memory.c': 'platform/linux/memory.c', 'runtime/fp_trap.c': 'platform/linux/fp_trap.c',
                'hle/host.c': 'platform/linux/host.c', 'gs/present.c': 'platform/linux/present.c', 'gs/gpu.c': 'platform/linux/gpu.c'}
-# Texture packs/sharp fonts and WinHTTP still use Windows APIs. The native Vulkan
-# backend is linked for offscreen rendering; window selection/presentation is separate.
+# Texture packs/sharp fonts and WinHTTP still use Windows APIs. Native rendering
+# and SDL Vulkan presentation are included in the ordinary Linux build.
 LINUX_LATER = {'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
 LINUX_INCLUDE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'platform', 'linux', 'include')
 # The game's code keeps the stack only 4-aligned, as on Windows (pctarget.py): host functions it

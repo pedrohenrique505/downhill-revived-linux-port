@@ -281,6 +281,7 @@ int native_present_options(Native *n);  /* DHD_PRESENT_FILTER and DHD_ASPECT; 0:
 /* The picture's size in a w x h window (DHD_ASPECT, 2D fields at 4:3). */
 void native_viewport(const Native *n, unsigned w, unsigned h, float *vw, float *vh);
 void native_page_inverse(uint32_t inverse[4096]);  /* raster.hlsl's page-word-to-pixel table */
+int native_capture_display(Native *n, unsigned *width, unsigned *height);
 int native_capture(Native *n, uint32_t *pixels);   /* gs_gpu_capture */
 void native_profile(Native *n);                    /* gs_gpu_profile, and at exit */
 

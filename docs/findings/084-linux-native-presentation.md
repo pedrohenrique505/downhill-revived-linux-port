@@ -48,3 +48,21 @@ with zero warnings/errors. Results: 150 game fields each, 150/283/344 presented
 pictures, 0/267/324 interpolated pictures. Rendered totals can advance by one
 before shutdown. Evidence: `build/port/issue16/window/`. These are synthetic
 pictures, not full-race acceptance. Ordinary game link/live checks are pending.
+
+## Capture boundary and regression checks
+
+Capture display dimensions now come from the raw completed picture, independently
+of `DHD_SCREENSHOT_WINDOW`. A movie fixture checks formatted 320x200 screenshots
+alongside raw 32x24 capture size/content; all three window modes pass strict
+validation again (150 fields; 150/296/355 presents). The ordinary Linux link
+completes with its existing 23 SDK stubs and no unresolved symbols. All eight
+SPIR-V modules/stage/embedding checks and the portable-frontend header check pass.
+All 23 validated replays (86 fields) retain exactly the previous issue-15 RGBA
+hashes, FIFO readbacks and profile counters. Evidence: `build/port/issue16/replay/`,
+`issue16-replay.log`, `issue16-spirv.log`, `issue16-portable.log` under build/port/.
+
+First live race uses the native window, scaled screenshots, DHD_DUMP, benchmark
+and timeline successfully. Actual window and internal pictures inspected after
+resize. Its GDB observer stops every field and reports only 56.54 fields/s at
+6000-6600; this is retained as an instrumented result, not a 60-Hz performance
+claim. Full-race completion and unpaused 120/144 Hz checks are still running.
