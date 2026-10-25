@@ -2015,3 +2015,8 @@ exact compute binaries and preprocessed D3D11 HLSL tokens remain unchanged. Nati
 pipeline creation and picture validation remain separate work; src/ and strict checks unchanged.
 The ordinary Linux link completed; all eight validated native modules were also found
 byte-for-byte in build/port/link/dhd (link census: 23 SDK stubs, no remaining undefined symbols).
+
+Native Vulkan backend started (2026-10-25, finding 083, fork issue #15): scaled
+colour/depth surfaces and deferred native resources implemented in an offscreen
+backend. Pipeline/draw integration and image acceptance are in progress; no
+rendering or parity result claimed yet. Matching source/checks unchanged.
