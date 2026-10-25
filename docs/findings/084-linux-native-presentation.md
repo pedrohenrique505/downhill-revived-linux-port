@@ -100,3 +100,23 @@ vsync case. Scanout and presentation additionally share one submission on a
 window, removing a CPU fence wait for the current field; skipped presentations
 still submit the field's work. Offscreen submissions are unchanged.
 Evidence: `issue16-vsync-stacks.log`, `window-fair/`, `window-submit/`.
+
+## Picture-rate reporting after benchmark reset
+
+The first corrected 120-Hz full race finishes at official tick 23551, includes
+600 further fields (the normal result transition), resizes twice and closes with
+exit 0. Benchmark fields 6000-6600: 53.721 game fields/s and 120.10 pictures/s,
+1319 interpolated pictures. Wall duration 518.93 s includes boot/loading. API
+validation was off for this timing run; the separate window/replay fixtures have
+strict validation on. Evidence: `race120-final/result.json` and `run.log`.
+
+DHD_BENCH resets interval timestamps, but the exit profile used lifetime picture
+counts as its numerator, inflating the reported rate. It now uses the interval
+count from the same epoch as the timestamps. A fixture observes the first
+post-reset picture's count and wall time independently, and compares the report
+within 5% (includes polling/readback latency). The old formula reports 137.72
+while the independent rate is 109.99 (FAIL); corrected report 111.54 versus
+111.11 (PASS). This checks accuracy under load rather than assuming the GPU can
+always reach the configured rate. All four API/synchronization window modes
+pass again. Evidence: `window-profile-final/`,
+`issue16-profile-red-green-final.log`. Timing changes do not alter rendering.

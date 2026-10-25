@@ -1854,12 +1854,14 @@ static void native_intervals(Native *n, const char *label, uint64_t presented, u
     unsigned worst = count / 100 ? count / 100 : 1;
     double tail = 0;
     for (unsigned i = count - worst; i < count; i++) tail += sorted[i];
+    /* DHD_BENCH resets this interval epoch, while lifetime presented counters
+       continue. Match the numerator to the same epoch as these timestamps. */
     double seconds = n->last_present - n->first_present;
     const NativeStats *s = &n->stats;
     uint64_t total = s->paired_vertices + s->held_vertices + s->jumped_vertices;
     fprintf(stderr, "%s: displayed_fps=%.2f present_ms p50=%.2f p99=%.2f worst1pct=%.2f max=%.2f interpolated=%llu "
             "paired=%.1f%% held=%.1f%% jumped=%.1f%%\n", label,
-            seconds > 0 && presented ? (double)(presented - 1) / seconds : 0, sorted[count / 2], sorted[count * 99 / 100],
+            seconds > 0 && presented ? (double)n->interval_count / seconds : 0, sorted[count / 2], sorted[count * 99 / 100],
             tail / worst, sorted[count - 1], (unsigned long long)interpolated, total ? 100.0 * s->paired_vertices / total : 0,
             total ? 100.0 * s->held_vertices / total : 0, total ? 100.0 * s->jumped_vertices / total : 0);
     fflush(stderr);

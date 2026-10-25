@@ -5,6 +5,7 @@ VK_LAYER_KHRONOS_validation, including its i686 shared library.
 """
 import argparse
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -35,6 +36,14 @@ def main():
         log = run.stdout + run.stderr
         (out / f'{hz}.log').write_text(log)
         print(run.stdout, end='')
+        # The profile's rate must use the interval epoch reset by DHD_BENCH,
+        # rather than dividing lifetime picture counts by that shorter time.
+        if hz in (120, 144):
+            rate = re.search(r'profile interp: displayed_fps=([0-9.]+)', log)
+            observed = re.search(r'observed_fps=([0-9.]+)', run.stdout)
+            if not rate or not observed or abs(float(rate[1]) / float(observed[1]) - 1) > 0.05:
+                sys.stderr.write(log)
+                return 1
         if run.returncode or 'PASS' not in run.stdout or any(m in log for m in
                 ('Validation Error', 'Validation Warning', 'VUID-', 'Vulkan validation:')):
             sys.stderr.write(run.stderr)
