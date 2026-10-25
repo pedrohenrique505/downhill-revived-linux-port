@@ -125,3 +125,13 @@ VK_LAYER_PATH=/path/to/local/manifests python port/tools/test_native_replay.py b
 WINEPREFIX=/path/to/dxvk/prefix python port/tools/test_native_replay.py build/port/d3d FIELD.gs --all-pictures
 python port/tools/compare_native_pictures.py build/port/d3d build/port/vk build/port/comparison.json
 ```
+
+## Checkout re-check
+
+Same day, on a clean checkout at 149816e, with the local Khronos layer: the 17 transfer/backend
+fixtures pass with `--vulkan --validation`. All 23 captures (86 fields, scale 2) replay with
+validation enabled in every run and no VUIDs, validation warnings or errors. Against the D3D11
+references: 84/86 identical RGBA hashes, the same two fields at two pixels each (MAE 7.27e-7,
+max 1), 23 matching FIFO transcripts. The Linux link completes with 23 stubs and nothing left
+undefined. `src/`, `config/` and `tools/` are unchanged since a0ce095.
+Evidence (ignored): build/port/issue15/recheck-vk/, recheck-comparison.json, recheck-link.log.
