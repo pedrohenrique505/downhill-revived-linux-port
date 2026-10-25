@@ -380,7 +380,7 @@ def patch_source(source=SOURCE):
     # project file. Reapplying produces identical source even if hooks changed.
     for relative in ('pcsx2/VMManager.cpp', 'pcsx2/MTGS.cpp',
                      'pcsx2/GS/Renderers/Common/GSRenderer.cpp', 'pcsx2/GS/GSCapture.cpp',
-                     'pcsx2/GS/Renderers/SW/GSRendererSW.cpp'):
+                     'pcsx2/GS/Renderers/SW/GSRendererSW.cpp', 'pcsx2/GSDumpReplayer.cpp'):
         original = subprocess.check_output(['git', '-C', str(source), 'show', REVISION + ':' + relative])
         (source / relative).write_bytes(original)
     vm = source / 'pcsx2/VMManager.cpp'
@@ -408,6 +408,20 @@ def patch_source(source=SOURCE):
                  '#include "GS/Renderers/SW/GSRendererSW.h"\n#include "GS/GSPng.h"\n#include "common/Path.h"\n#include <algorithm>\n#include <cstdlib>\n#include <cstdio>\nextern u32 dhd_comparison_gs_frame;\nbool DhdComparisonTarget(u32 completed);')
     needle = '\t\tm_texture[index]->Update(out_r, m_output, pitch);'
     replace_once(sw, needle, needle + '\n' + SOFTWARE_CAPTURE)
+    replay = source / 'pcsx2/GSDumpReplayer.cpp'
+    replace_once(replay, '#include <atomic>', '#include <atomic>\n#include <cstdio>\n#include <cstdlib>')
+    needle = '\t\t\tMTGS::InitAndReadFIFO(arr.get(), size);'
+    replace_once(replay, needle, needle + r'''
+            // Opt-in oracle output, same length-prefixed format as port/gs/replay.c.
+            // The returned bytes are observed after the synchronous MTGS read.
+            if (const char* path = std::getenv("DHD_COMPARE_READBACKS")) {
+                static std::FILE* output = std::fopen(path, "wb");
+                const u32 bytes = size * 16;
+                if (!output || std::fwrite(&bytes, sizeof(bytes), 1, output) != 1 ||
+                    std::fwrite(arr.get(), 1, bytes, output) != bytes || std::fflush(output))
+                    std::exit(31);
+            }
+''')
     # Current public dependency bundle uses FFmpeg 8+, which removed AVCodec's
     # format arrays. Keep video capture compiling through its supported query API.
     capture = source / 'pcsx2/GS/GSCapture.cpp'
@@ -440,6 +454,9 @@ def patch_source(source=SOURCE):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--patch-only', action='store_true')
+    parser.add_argument('--gsrunner', action='store_true', help='Linux: build the headless GS replay runner only')
+    parser.add_argument('--prefix', type=Path, help='Linux: isolated dependency installation prefix')
+    parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
     SOURCE.parent.mkdir(parents=True, exist_ok=True)
     if not SOURCE.exists():
@@ -451,6 +468,24 @@ def main():
     patch_source()
     if args.patch_only:
         print(SOURCE)
+        return
+    if os.name != 'nt':
+        build = ROOT / 'build/port/compare-pcsx2-build'
+        command = ['cmake', '-S', str(SOURCE), '-B', str(build), '-G', 'Ninja',
+                   '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_C_COMPILER=clang',
+                   '-DCMAKE_CXX_COMPILER=clang++', '-DENABLE_GSRUNNER=ON',
+                   '-DENABLE_QT_UI=' + ('OFF' if args.gsrunner else 'ON'),
+                   '-DUSE_VULKAN=OFF', '-DUSE_OPENGL=ON', '-DX11_API=ON',
+                   '-DWAYLAND_API=OFF', '-DUSE_BACKTRACE=OFF',
+                   '-DCMAKE_DISABLE_FIND_PACKAGE_FFMPEG=TRUE']
+        if args.prefix:
+            command.append('-DCMAKE_PREFIX_PATH=' + str(args.prefix.resolve()))
+        subprocess.run(command, check=True)
+        target = 'pcsx2-gsrunner' if args.gsrunner else 'pcsx2-qt'
+        subprocess.run(['cmake', '--build', str(build), '--target', target,
+                        '-j', str(args.jobs)], check=True)
+        shutil.copytree(SOURCE / 'bin/resources', build / 'bin/resources', dirs_exist_ok=True)
+        print(build / 'bin' / target)
         return
     archive = ROOT / 'build/port/compare-research/deps.7z'
     if not (SOURCE / 'deps/include/QtCore').exists():

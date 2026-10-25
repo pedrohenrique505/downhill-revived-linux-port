@@ -1963,3 +1963,10 @@ EE fiber stacks now sit below 0x10000000: the game masks a stack packet address 
 All captures keep byte-identical final VRAM; new fixtures aliased_states and
 deferred_read_waits go red without their rules. Menu is now limited by VU/GS CPU work; real
 time in the menu and independent retail/D3D11 parity remain open.
+
+Linux picture acceptance continuation (2026-10-25, finding 080, fork issue #1):
+the pinned PCSX2 comparison adapter now has a Linux CMake build path and opt-in
+synchronous FIFO response export. Fresh race fields 3000–3002 reproduce identical
+RGB through Vulkan replay; those fields have no FIFO reads. Nine comparison tests
+pass. PCSX2 picture/outlier and independent retail acceptance remain in progress;
+no final image MATCH is claimed.
