@@ -337,11 +337,7 @@ static void local_copies(void)
             else if (memcmp(expected, gs.vram, sizeof expected)) { printf("FAIL local copy %u\n", n); failures++; }
         }
     }
-#ifdef __linux__
-    CHECK(gpu_copies == 0); /* Correctness-first Vulkan uses the ordered CPU transfer fallback. */
-#else
     CHECK(gpu_copies == sizeof copies / sizeof *copies - 1);
-#endif
     gs.local_copy = hook;
 }
 
