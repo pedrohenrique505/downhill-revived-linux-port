@@ -10,19 +10,8 @@
 #include <string.h>
 #include "gs_shader.h"  /* embedded from raster.hlsl by the build */
 
-typedef struct {
-    uint32_t reg[128][4], position[3][4], uv[3][4];
-    float stq[3][4];
-    uint32_t bounds[4], info[4], palette[256];
-} Constants;
-
-enum { MAX_DRAWS = 256, MAX_BIN_WORDS = 1024 * 1024 };
-typedef struct {
-    uint32_t position[3][4], uv[3][4];
-    float stq[3][4];
-    uint32_t info[4], bounds[4];
-    uint32_t depth[8];
-} Primitive;
+#include "raster_types.h"
+#include "raster_math.h"
 
 enum { TRACE_RING = 32, TRACE_DISPATCHES = 2048 };
 typedef struct {
@@ -434,27 +423,7 @@ static void texture_pages(Gpu *gpu, Gs *g, unsigned ctxt)
     uint64_t mip[2] = {g->reg[GS_MIPTBP1_1 + ctxt], g->reg[GS_MIPTBP2_1 + ctxt]};
     if (gpu->texture_valid && gpu->texture_key == tex && gpu->clamp_key == clamp &&
         gpu->tex1_key == tex1 && gpu->mip_key[0] == mip[0] && gpu->mip_key[1] == mip[1]) return;
-    unsigned mmin = (unsigned)(tex1 >> 6) & 7, levels = (unsigned)(tex1 >> 2) & 7;
-    if (levels > 6) levels = 6;
-    if (mmin < 2 || mmin > 5) levels = 0;
-    memset(gpu->texture_pages, 0, sizeof gpu->texture_pages);
-    for (unsigned level = 0; level <= levels; level++) {
-        unsigned lo[2] = {0,0}, hi[2];
-        for (unsigned axis = 0; axis < 2; axis++) {
-            unsigned mode = (unsigned)(clamp >> (axis * 2)) & 3;
-            unsigned minimum = ((unsigned)(clamp >> (4 + axis * 20)) & 1023) >> level;
-            unsigned maximum = ((unsigned)(clamp >> (14 + axis * 20)) & 1023) >> level;
-            unsigned size = (unsigned)(tex >> (26 + axis * 4)) & 15;
-            size = size > level ? size - level : 0;
-            hi[axis] = size >= 11 ? 2047 : (1u << size) - 1;
-            if (mode == 2) { lo[axis] = minimum; hi[axis] = maximum; }
-            if (mode == 3) { lo[axis] = maximum; hi[axis] = maximum | minimum; }
-            if (lo[axis] > hi[axis]) { lo[axis] = 0; hi[axis] = 2047; }
-        }
-        uint64_t location = level ? mip[(level - 1) / 3] >> (((level - 1) % 3) * 20) : tex;
-        gs_mark_pages(gpu->texture_pages, (unsigned)(tex >> 20) & 63, (unsigned)location & 16383,
-                      (unsigned)(location >> 14) & 63, lo[0], lo[1], hi[0], hi[1]);
-    }
+    gs_raster_texture_pages(gpu->texture_pages, g, ctxt);
     gpu->texture_key = tex; gpu->clamp_key = clamp; gpu->texture_valid = 1;
     gpu->tex1_key = tex1; gpu->mip_key[0] = mip[0]; gpu->mip_key[1] = mip[1];
 }
@@ -462,23 +431,6 @@ static void texture_pages(Gpu *gpu, Gs *g, unsigned ctxt)
 static int minimum(int a, int b) { return a < b ? a : b; }
 static int maximum(int a, int b) { return a > b ? a : b; }
 
-static int independent_pixels(Gs *g, unsigned ctxt)
-{
-    uint64_t frame = g->reg[GS_FRAME_1 + ctxt], z = g->reg[GS_ZBUF_1 + ctxt];
-    uint64_t scissor = g->reg[GS_SCISSOR_1 + ctxt];
-    unsigned bw = (unsigned)(frame >> 16) & 63;
-    unsigned x = (unsigned)(scissor >> 16) & 2047, y = (unsigned)(scissor >> 48) & 2047;
-    /* Aliased rows or overlapping color/Z surfaces can communicate across
-       pixels. Keep a dispatch boundary between such primitives. */
-    if (!bw || x >= bw * 64 || (y / 32 + 1) * bw > 512) return 0;
-    uint64_t test = g->reg[GS_TEST_1 + ctxt];
-    if ((z >> 32 & 1) && (!(test >> 16 & 1) || (test >> 17 & 3) <= 1)) return 1;
-    uint32_t color[16] = {0}, depth[16] = {0};
-    gs_mark_pages(color, (unsigned)(frame >> 24) & 63, ((unsigned)frame & 511)*32, bw, 0,0,x,y);
-    gs_mark_pages(depth, 48 | ((unsigned)(z >> 24) & 15), ((unsigned)z & 511)*32, bw, 0,0,x,y);
-    for (unsigned i = 0; i < 16; i++) if (color[i] & depth[i]) return 0;
-    return 1;
-}
 
 /* Each 8x8 tile receives primitive indices in submission order. Pixels execute
    that list serially, retaining GS blending/Z order without a dispatch per
@@ -676,22 +628,7 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
                     ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
     unsigned ctxt = prim >> 9 & 1;
     trace_draw(g, prim, v, count);
-    /* Keep integer Z exact through plane setup and interpolation. GS software
-       rendering uses double precision for depth, independently of ST/RGBA. */
-    double depth[4] = {v[0].z, 0, 0, 0};
-    if (type == 1 || type == 2) {
-        int dx = (int)v[1].x - (int)v[0].x, dy = (int)v[1].y - (int)v[0].y;
-        unsigned axis = abs(dx) >= abs(dy) ? 1 : 2;
-        int distance = axis == 1 ? dx : dy;
-        if (distance) depth[axis] = ((double)v[1].z - v[0].z) / distance;
-    } else if (count == 3) {
-        double dx1 = (int)v[1].x - (int)v[0].x, dy1 = (int)v[1].y - (int)v[0].y;
-        double dx2 = (int)v[2].x - (int)v[0].x, dy2 = (int)v[2].y - (int)v[0].y;
-        double dz1 = (double)v[1].z - v[0].z, dz2 = (double)v[2].z - v[0].z;
-        double area = dx1 * dy2 - dy1 * dx2;
-        if (area) { depth[1] = (dz1 * dy2 - dy1 * dz2) / area; depth[2] = (dx1 * dz2 - dz1 * dx2) / area; }
-    }
-    memcpy(c.depth, depth, sizeof depth);
+    gs_raster_depth(v, type, count, c.depth);
     uint64_t offset = g->reg[GS_XYOFFSET_1 + ctxt], scissor = g->reg[GS_SCISSOR_1 + ctxt];
     int minx = 65536, miny = 65536, maxx = -65536, maxy = -65536;
     for (unsigned i = 0; i < count; i++) {
@@ -720,7 +657,7 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
         }
         for (unsigned i = 0; i < 256; i++) gpu->state.palette[i] = gs_palette(g, g->reg[GS_TEX0_1 + ctxt], i);
         gpu->state_version = g->state_version; gpu->state_context = ctxt;
-        gpu->batch_safe = independent_pixels(g, ctxt);
+        gpu->batch_safe = gs_raster_independent_pixels(g, ctxt);
         gpu->hardware_rejection = hardware_state_rejection(g, ctxt);
     }
     c.bounds[0] = (uint32_t)minx; c.bounds[1] = (uint32_t)miny;
