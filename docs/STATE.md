@@ -2013,3 +2013,5 @@ preserve dual-source blending, and vertex compilation flips clip Y for positive-
 viewports. Descriptor/stage/embedding tests and existing i686 RADV GPU/GS/capture fixtures pass;
 exact compute binaries and preprocessed D3D11 HLSL tokens remain unchanged. Native Vulkan
 pipeline creation and picture validation remain separate work; src/ and strict checks unchanged.
+The ordinary Linux link completed; all eight validated native modules were also found
+byte-for-byte in build/port/link/dhd (link census: 23 SDK stubs, no remaining undefined symbols).

@@ -83,3 +83,9 @@ Vulkan pipeline exists; shader validation alone does not establish image parity.
 - Negative control: removing `used` from the generated header removes the native
   vertex module from the optimised i686 object, confirming the retention check
   detects the otherwise silent loss of unreferenced shaders.
+- Ordinary `python port/tools/link.py`: successful Linux link, 4,580 objects,
+  0 duplicate definitions, no remaining undefined symbols (23 SDK stubs reported
+  by the link census). Read back build/port/link/dhd and found every one of the
+  eight validated native SPIR-V files byte-for-byte in the executable;
+  llvm-nm also lists all eight retained module symbols. This is a link/embedding
+  check, not a new gameplay or image-equivalence claim.
