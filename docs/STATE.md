@@ -1993,3 +1993,11 @@ only the explained edge pixel; fields 4220–4280 deliver 59.167 fields/s and ex
 normally. Full independent game-state/camera equality is not established by
 this renderer check. Evidence/report stays in ignored build/port/issue1-picture/;
 the corrected executable is build/port/run/dhd. Matching sources/checks unchanged.
+
+Native renderer split (2026-10-25, finding 081, fork issue #13): `gpu_native.inc` is now only the
+Direct3D 11 backend; the renderer itself is `native.c`/`native.h`, which include no graphics API
+header (`check_native_portable.py`) and reach the backend through `native_gpu_*` and the exact
+backend through `NativeHost`. Checked under Wine (DXVK, Microsoft's d3dcompiler_47) with
+`test_native_replay.py`: 86 pictures from the local captures, readbacks and profile counters are
+the same before and after at scales 1, 2, 4 and window, with diagnostics and with DHD_INTERP.
+The Windows game-state gate on a real dhd.exe is still to be run.
