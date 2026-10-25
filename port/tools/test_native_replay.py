@@ -1,4 +1,4 @@
-"""Native renderer pictures over local GS captures (D3D11; port/gs/test_native_replay.c).
+"""Native renderer pictures over local GS captures (D3D11 or offscreen Linux Vulkan).
 
 Builds the replay with this tree's native renderer, runs every capture given and writes, per
 capture, each field's picture hash and the readbacks' hash to OUT/summary.txt. With --expect, the
@@ -28,11 +28,11 @@ SOURCES = ('test_native_replay.c', 'gpu.c', 'native.c', 'gs.c', 'memory.c')
 LINUX = sys.platform.startswith('linux')
 
 
-def build(out, tree, vulkan=False):
+def build(out, tree, vulkan=False, source='test_native_replay.c'):
     if vulkan:
         from vulkan_shaders import generate
         generate(out / "gs_spirv.h")
-        sources = [ROOT / "port/gs/test_native_replay.c",
+        sources = [ROOT / "port/gs" / source,
                    *[tree / "port/gs" / name for name in ("native.c", "gs.c", "memory.c")],
                    *[tree / "port/platform/linux" / name for name in ("gpu.c", "native_gpu.c", "win32.c")]]
         exe = out / "test-native-vulkan"
@@ -65,6 +65,7 @@ def main():
     ap.add_argument('captures', type=Path, nargs='+')
     ap.add_argument('--vulkan', action='store_true', help='build/run the Linux offscreen Vulkan backend')
     ap.add_argument('--validation', action='store_true', help='require Khronos validation and synchronization checks (--vulkan)')
+    ap.add_argument('--all-pictures', action='store_true', help='save every field as PPM for cross-backend comparison')
     ap.add_argument('--expect', type=Path, help='an earlier summary.txt the pictures must match')
     ap.add_argument('--tree', type=Path, default=ROOT, help='the checkout whose renderer is built (default: this one)')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for the replay (DHD_* are otherwise cleared)')
@@ -77,7 +78,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     exe = build(out, args.tree.resolve(), args.vulkan)
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
+    env.setdefault('DXVK_STATE_CACHE_PATH', str(out))
     env.update(item.split('=', 1) for item in args.env)
+    if args.all_pictures:
+        env['DHD_REPLAY_ALL'] = '1'
     if args.validation:
         env['VK_LAYER_VALIDATE_SYNC'] = '1'
         env['DHD_VK_VALIDATE'] = '1'
@@ -89,7 +93,7 @@ def main():
         capture = capture.resolve()
         name = capture.relative_to(ROOT).as_posix() if ROOT in capture.parents else capture.name
         prefix = out / name.replace('/', '_').removesuffix('.gs')
-        run = subprocess.run(runner + [str(capture), str(prefix)], cwd=ROOT, env=env, capture_output=True, text=True)
+        run = subprocess.run(runner + [str(capture), str(prefix)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=180)
         lines.append('== ' + name)
         lines += [line for line in run.stdout.splitlines() if line.startswith(('field ', 'readbacks '))]
         lines += [line for line in run.stderr.splitlines() if line.startswith('profile native:')]

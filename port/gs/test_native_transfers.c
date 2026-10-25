@@ -1,8 +1,16 @@
 /* Native transfer ordering, using synthetic solid colours and no game data.
    The presenter, texture replacements and EE scheduler are absent. */
 #define COBJMACROS
+#ifdef DHD_NATIVE_VULKAN
+#include "../platform/linux/gpu.h"
+#include "../platform/linux/native_gpu.h"
+#define gs_native_vsync native_vsync
+uint32_t *gs_native_picture(Gs *, unsigned *, unsigned *);
+#else
 #include "gpu_win32.h"
+#endif
 #include "present.h"
+#include "gpu.h"
 #include "texpack.h"
 #include "font_sharp.h"
 #include <windows.h>
@@ -15,6 +23,7 @@ void pacing_handed(double *d,double *b) {*d=*b=0;}
 void pacing_present(double d,double b) {(void)d;(void)b;}
 int host_widescreen_flat_limit(void) {return 1000;}
 double host_widescreen_aspect(void) {return 16.0/9;}
+#ifndef DHD_NATIVE_VULKAN
 UINT gs_swap_chain_flags(void) {return 0;}
 void gs_frame_latency_wait(void) {}
 HRESULT gs_present(IDXGISwapChain *s) {return IDXGISwapChain_Present(s,0,0);}
@@ -27,6 +36,14 @@ void texpack_report(void) {}
 int font_sharp_on(void) {return 0;}
 int font_sharp_match(uint64_t t) {return 0;}
 ID3D11ShaderResourceView *font_sharp_view(ID3D11Device *d,const uint32_t *p,unsigned w,unsigned h,uint64_t k) {return NULL;}
+#else
+int texpack_available(void) { return 0; }
+TexPackEntry *texpack_find(const Gs *g, unsigned c) { (void)g; (void)c; return NULL; }
+void texpack_field(uint64_t f) { (void)f; }
+void texpack_report(void) {}
+int font_sharp_on(void) { return 0; }
+int font_sharp_match(uint64_t t) { (void)t; return 0; }
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,16 +99,86 @@ static void sample_alpha(unsigned x, unsigned y, unsigned alpha, const char *nam
     show(256, alpha, name);
 }
 
+#ifdef DHD_NATIVE_VULKAN
+/* Backend seams the game's transfer stream does not always exercise: mixed scales,
+   overlapping self copies, target feedback, surface growth and reversed depth. */
+static void backend_cases(void)
+{
+    Native *n = native_of(&gs);
+    EnterCriticalSection(&n->context_lock);
+    int base = n->surface_count;
+    n->surface_count += 3;
+    NativeSurface *large = &n->surfaces[base], *small = large+1, *depth = large+2;
+    large->scale = 2; small->scale = 1; depth->scale = 2; depth->depth = 1;
+    unsigned want[2] = {64,64};
+    native_gpu_surface(n, large, want); native_gpu_surface(n, small, want); native_gpu_surface(n, depth, want);
+    uint32_t page[64*64];
+    for (unsigned i = 0; i < 64*64; i++) page[i] = i%64 < 32 ? 0x800000ff : 0x8000ff00;
+    NativeCommand commands[3] = {{.kind=NATIVE_IMPORT,.target=base+1,.w=64,.h=64,.pixels=page},
+        {.kind=NATIVE_COPY,.source=base+1,.target=base,.w=64,.h=64},
+        {.kind=NATIVE_COPY,.source=base,.target=base,.sx=0,.sy=0,.x=8,.y=0,.w=56,.h=64}};
+    NativeFrame f = {.commands=commands,.command_count=3,.display_surface=base,
+        .display={0,0,0,0,0,64,64,0,0,0,0,0}};
+    native_gpu_draw(n, &f, NULL); native_gpu_scanout(n, &f);
+    uint32_t pixels[128*128];
+    int ok = native_gpu_read(n, pixels);
+    for (unsigned y=0; y<128; y++) for (unsigned x=0; x<128; x++)
+        if ((pixels[y*128+x]&0xffffff) != (x<80 ? 0xffu : 0xff00u)) ok=0;
+    printf("mixed-scale blit and overlapping self copy: %s\n", ok ? "PASS":"FAIL"); failures += !ok;
+    /* Growing keeps the old colour pixels; the new area is cleared. */
+    want[0]=128;
+    native_gpu_surface(n, large, want); native_gpu_surface(n, depth, want);
+    f.command_count=0; f.display[5]=128;
+    native_gpu_draw(n,&f,NULL); native_gpu_scanout(n,&f);
+    uint32_t grown[256*128]; ok=native_gpu_read(n,grown);
+    for (unsigned y=0; y<128; y++) for (unsigned x=0; x<256; x++)
+        if ((grown[y*256+x]&0xffffff) != (x<80 ? 0xffu : x<128 ? 0xff00u : 0)) ok=0;
+    printf("grown surface preserves old pixels and clears new extent: %s\n",ok?"PASS":"FAIL"); failures += !ok;
+    /* Six vertices cover the GS surface. The second draw's greater test must fail. */
+    NativeVertex vertices[12];
+    static const float xy[6][2]={{0,0},{128,0},{0,64},{0,64},{128,0},{128,64}};
+    for(unsigned i=0;i<12;i++) vertices[i]=(NativeVertex){.x=xy[i%6][0],.y=xy[i%6][1],
+        .z=i<6 ? 0.75f:0.25f,.q=1,.rgba=i<6 ? 0x800000ff:0x8000ff00};
+    NativeCommand draws[2]={{.kind=NATIVE_DRAW,.target=base,.depth=base+2,.texture_surface=-1,.convert=-1,
+        .depth_key=8|4|1,.color_mask=15,.scissor={0,0,128,64},.constants={.target={2048,2048}},.count=6},
+        {.kind=NATIVE_DRAW,.target=base,.depth=base+2,.texture_surface=-1,.convert=-1,
+        .depth_key=8|4|3,.color_mask=15,.scissor={0,0,128,64},.constants={.target={2048,2048}},.first=6,.count=6}};
+    f.commands=draws; f.command_count=2; f.vertices=vertices; f.vertex_count=12;
+    native_gpu_draw(n,&f,vertices); native_gpu_scanout(n,&f); ok=native_gpu_read(n,grown);
+    for(unsigned i=0;i<256*128;i++) if((grown[i]&0xffffff)!=0xff) ok=0;
+    printf("reversed GS depth test: %s\n",ok?"PASS":"FAIL"); failures += !ok;
+    /* Fill magenta first: sampling a dummy/black image would erase blue, and ignoring
+       the colour mask would let the vertex colour erase red. */
+    for (unsigned i = 0; i < 6; i++) vertices[i].rgba = 0x80ff00ff;
+    draws[0].depth = -1; f.command_count = 1;
+    native_gpu_draw(n, &f, vertices);
+    /* A snapshot of the target is sampled while blue alone is written; red stays. */
+    for(unsigned i=0;i<6;i++) {vertices[i].s=xy[i][0]/128;vertices[i].t=xy[i][1]/64; vertices[i].rgba=0x80808000;}
+    draws[0].depth=-1; draws[0].texture_surface=base; draws[0].color_mask=4;
+    draws[0].constants.flags=1; /* texture modulation; red becomes zero before write mask */
+    draws[0].constants.tex_size[0]=128; draws[0].constants.tex_size[1]=64;
+    draws[0].constants.alpha_scale=1; f.command_count=1;
+    native_gpu_draw(n,&f,vertices); native_gpu_scanout(n,&f); ok=native_gpu_read(n,grown);
+    for(unsigned i=0;i<256*128;i++) if((grown[i]&0xffffff)!=0xff00ff) ok=0;
+    printf("target feedback snapshot with colour mask: %s\n",ok?"PASS":"FAIL"); failures += !ok;
+    LeaveCriticalSection(&n->context_lock);
+}
+#endif
+
 int main(void)
 {
     gs_reset(&gs);
     _putenv("DHD_RENDER=native");
     _putenv("DHD_SCALE=2");
+#ifdef DHD_NATIVE_VULKAN
+    if (!gs_vulkan_init(&gs) || !gs_vulkan_native(&gs)) return 2;
+#else
     ID3D11Device *device;
     ID3D11DeviceContext *context;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
                                D3D11_SDK_VERSION, &device, NULL, &context)) ||
         !gs_gpu_init(&gs, device, context) || !gs_gpu_native(&gs)) return 2;
+#endif
 
     /* The upload is later than the clear, even though the native draw batch is open. */
     clear(0, 0x80000000);
@@ -136,8 +223,13 @@ int main(void)
     show(56, 0x8000FF00, "font alpha preserves the whole first loading buffer");
     show(112, 0x800000FF, "font alpha preserves the second loading buffer's corner");
 
+#ifdef DHD_NATIVE_VULKAN
+    backend_cases();
+#endif
     gs_gpu_destroy(&gs);
+#ifndef DHD_NATIVE_VULKAN
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
+#endif
     return failures ? 1 : 0;
 }

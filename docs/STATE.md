@@ -2027,3 +2027,17 @@ Work paused per user instruction before adding tooling: this host lacks the
 32-bit Khronos validation layer required for issue #15 acceptance. Windows picture
 comparison, broader regressions and ordinary link integration remain pending;
 no parity/validation/issue completion claimed. Evidence stays in build/port/issue15/.
+
+Native Vulkan offscreen backend complete (2026-10-25, finding 083, fork issue #15):
+scaled RGBA8/D32 surfaces, decoded texture uploads/cache, blend/depth/mask pipeline
+cache, draws, feedback snapshots, copies/blits, masked alpha and surface conversions
+now implement native_gpu_* on a separate device from the exact Z probe. Explicit
+gs_vulkan_native() and the frontend link in the ordinary Linux build; window/native
+selection and swapchain presentation remain a separate step. A local i686 Khronos
+layer was extracted under build/ without sudo. API plus synchronization validation
+passes all 23 captures/86 fields at 1x, 2x and 4x, and 17 synthetic transfer/backend
+checks. Fresh Windows D3D11 (Wine/DXVK) comparison at 2x: 84/86 RGBA hashes identical;
+the other two fields each differ in two pixels by one channel unit (RGB MAE
+7.26609e-7), all FIFO transcripts match. Existing exact GS/capture/GPU tests and
+portable-frontend check pass; exact compute binaries remain byte-identical.
+Evidence: build/port/issue15/. Matching sources/checks unchanged; no game data committed.

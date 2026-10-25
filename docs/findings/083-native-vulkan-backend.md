@@ -1,6 +1,6 @@
 # Native Vulkan graphics backend (fork issue #15)
 
-2026-10-25. In progress. Native drawing uses a separate Vulkan graphics/compute
+2026-10-25. Offscreen implementation and acceptance checks complete. Native drawing uses a separate Vulkan graphics/compute
 queue/device from the exact Z-probe renderer. Matching sources/checks are unchanged.
 Window/swapchain integration is outside this offscreen backend step.
 
@@ -38,7 +38,7 @@ Window/swapchain integration is outside this offscreen backend step.
    Evidence: build/port/issue15/first/. The sandbox driver run hit SIGSYS;
    the same replay completed outside the sandbox.
 
-## Pending tooling and acceptance
+## Initial tooling pause (resolved below)
 
 The host has no VkLayer_khronos_validation.json or
 libVkLayer_khronos_validation.so in /usr, /opt, /tmp, ~/.local or build/port.
@@ -68,3 +68,60 @@ attributes fix this, guarded so D3D11 sees unchanged declarations. Reference:
 The SPIR-V format regression failed before the fix and passes after it.
 Three menu fields now run with explicit validation plus synchronization checks,
 zero warnings/errors, and retain the D3D11 reference's exact RGBA hashes.
+
+## Offscreen image comparison and integration
+
+A fresh D3D11 run (Wine/DXVK, same prefix/compiler as finding 081) and Vulkan run
+with all 23 accepted version-8 captures saved every field (--all-pictures).
+The same 86 fields at scale 2 give 84 identical full-RGBA FNV hashes. The other
+two fields (retail-normalized/gs-g+30 field 5 and gs-g+600 field 1) each differ
+in only two RGB pixels by one channel unit: RGB MAE 0.000000726609003, maximum
+channel error 1, no pixel above 16. All 23 FIFO/readback transcripts and all
+frontend profile counters match. Pictures are compared at their original size,
+without masks, shifts or excluded pixels. This meets the recorded-field image
+comparison; it is Windows API code run through DXVK, not a physical Windows GPU.
+`compare_native_pictures.py` writes full per-field metrics and checks readbacks;
+its documented default bounds are MAE 0.1 and changed-pixel fraction 0.001.
+The measured differences are far below those bounds.
+
+Evidence (ignored): build/port/issue15/d3d-all-pictures/,
+vulkan-all-pictures/ and picture-comparison.json. Every Vulkan replay had explicit
+Khronos and synchronization validation enabled, zero API/undefined-value warnings
+or errors. The native GPU and both devices are destroyed before process exit.
+
+The shared 13 transfer fixtures pass Vulkan validation, plus backend fixtures for
+mixed-scale blits, overlapping self-copy snapshots, surface growth preserving old
+colour/clearing new pixels, reversed depth and masked target feedback. The existing
+GS memory/GIF/capture/exact GPU suite passes; native.c still compiles with all GPU
+headers poisoned. Native frontend teardown now releases frame/log storage after
+joining the worker and retiring native GPU work.
+
+Ordinary Linux link includes native.c/native_gpu.c and hooks backend destruction;
+texture packs and sharp font remain unavailable on Linux. The link completes with
+4,582 objects, no duplicates/remaining undefined symbols and the existing 23 SDK
+stubs. The window presenter still selects exact: this issue supplies the explicit
+gs_vulkan_native() offscreen API; swapchain/window presentation is a separate step.
+
+Additional scale checks: all 23 captures (86 fields) pass API/synchronization
+validation at scale 1 and scale 4 after the final resource cleanup. Their FIFO
+transcripts match the existing D3D11 references. RGBA hashes agree for 84/86 at
+1x and 69/86 at 4x. The reference has only the first three PPMs per capture
+(58 total): all those RGB pictures are identical at 1x; differing 4x pictures
+have maximum channel error 1, worst RGB MAE 0.000000290643601. The remaining
+hash differences at these extra scales have no full-picture score claimed;
+the full 86-picture acceptance comparison is at 2x. Raw summaries/partial
+scale scores: build/port/issue15/scales-comparison.json.
+
+The two exact compute modules remain byte-identical to their pre-change builds
+(SHA-256 compared). No retail code or strict image/decompilation checks changed.
+No game data or pictures are committed. No live native Linux window performance,
+presentation, texture pack/sharp font support or physical-Windows parity is claimed.
+
+Reproduce with a configured i686 Vulkan validation layer:
+
+```
+VK_LAYER_PATH=/path/to/local/manifests python port/tools/test_native_transfers.py --vulkan --validation
+VK_LAYER_PATH=/path/to/local/manifests python port/tools/test_native_replay.py build/port/vk FIELD.gs --vulkan --validation --all-pictures
+WINEPREFIX=/path/to/dxvk/prefix python port/tools/test_native_replay.py build/port/d3d FIELD.gs --all-pictures
+python port/tools/compare_native_pictures.py build/port/d3d build/port/vk build/port/comparison.json
+```

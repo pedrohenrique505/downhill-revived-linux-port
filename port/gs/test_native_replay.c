@@ -108,7 +108,7 @@ static void picture(const char *prefix, unsigned field)
     uint32_t *pixels = gs_native_picture(&gs, &w, &h);
     if (!pixels) { printf("field %u: none\n", field); return; }
     printf("field %u: %ux%u %016llx\n", field, w, h, (unsigned long long)fnv(0xCBF29CE484222325ull, pixels, (size_t)w * h * 4));
-    if (field >= 3) return;
+    if (field >= 3 && !getenv("DHD_REPLAY_ALL")) return;
     char name[1024]; snprintf(name, sizeof name, "%s-%03u.ppm", prefix, field);
     FILE *f = fopen(name, "wb"); if (!f) return;
     fprintf(f, "P6\n%u %u\n255\n", w, h);
