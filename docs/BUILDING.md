@@ -247,14 +247,18 @@ LLVM tools, a 32-bit C development environment, Vulkan headers and **both the
 Vulkan application alone does not establish i686 driver support. On Arch/AMD,
 the driver package is `lib32-vulkan-radeon` (with `lib32-vulkan-icd-loader`).
 
-Download the official Linux [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler/releases),
-extract it, and put `dxc` on PATH or set `DXC` to its executable. Shaders compile
-to SPIR-V at build time and are embedded in the host executable; no shader
-compiler is required at game startup. SDL3 is built by the existing build tools.
+Shaders compile to SPIR-V at build time with Microsoft's
+[DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler/releases)
+and are embedded in the host executable; no shader compiler is needed at game
+startup. The build downloads the pinned official Linux release (1.9.2609) once
+into `build/downloads`, checks its SHA-256 and unpacks it under `build/port/dxc`
+(`port/tools/vulkan_shaders.py`), as it does with SDL3's source. Set `DXC` to use
+another `dxc`; without network and without that download, a `dxc` on PATH is used
+with a warning.
 
 ```sh
 python port/tools/build.py
-DXC=/path/to/dxc python port/tools/link.py
+python port/tools/link.py
 DHD_ISO='/path/to/your/Downhill Domination (USA).iso' \
   DHD_RENDER=exact DHD_SKIP_MOVIES=1 ./build/port/link/dhd
 ```
@@ -262,12 +266,13 @@ DHD_ISO='/path/to/your/Downhill Domination (USA).iso' \
 Run the applicable GS memory and shared raster fixtures with:
 
 ```sh
-DXC=/path/to/dxc python port/tools/test_vulkan.py
+python port/tools/test_vulkan.py
 ```
 
-The initial backend completes ordered batches with fences, snapshots texture
-memory before feedback sampling, and merges CPU/GPU writes by GS page. Local
-copies use the existing ordered CPU transfer path. Scanout/readbacks synchronize
-VRAM before SDL uploads the display picture. These choices prioritize correctness;
+The backend records ordered batches in two fenced banks, snapshots the texture
+pages written since the last snapshot before feedback sampling, and merges CPU/GPU
+writes by GS page. Local copies and deferred readbacks run on the GPU in order,
+as on D3D11. Scanout synchronizes VRAM before SDL uploads the display picture
+(findings 077-079). These choices prioritize correctness;
 Vulkan support alone does not imply real-time performance. See finding 076 for
 validation results and outstanding acceptance work.

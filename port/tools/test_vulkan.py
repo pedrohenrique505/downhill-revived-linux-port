@@ -1,8 +1,9 @@
 """Build and run Linux exact-GS tests through public GIF/register/VRAM interfaces.
 
-Needs DXC, a C compiler, Vulkan headers/loader and an i686 Vulkan driver.
+Needs a C compiler, Vulkan headers/loader and an i686 Vulkan driver; the pinned
+DXC is fetched by vulkan_shaders.py (DXC=path selects another one).
 The fixtures are shared with D3D11 WARP; they contain no game data.
-DXC can point at an extracted official compiler; LD_LIBRARY_PATH can select
+LD_LIBRARY_PATH can select
 an isolated i686 driver. Run from anywhere: python port/tools/test_vulkan.py.
 """
 import argparse

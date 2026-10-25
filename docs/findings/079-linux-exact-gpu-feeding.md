@@ -102,3 +102,15 @@ Khronos Vulkan specification on [command buffer submission and fences](https://d
 and [synchronization](https://docs.vulkan.org/spec/latest/chapters/synchronization.html)
 (`vkGetFenceStatus`, transfer/compute barriers); the repository's D3D11 backend for
 `local_copy` and the asynchronous `stage_pages`/`fetch_pages` design. No external code was copied.
+
+## Pinned DXC
+
+The builds above used a DXC extracted by hand into `/tmp`, which nothing in the repository
+recreated. `port/tools/vulkan_shaders.py` now fetches the official Linux release v1.9.2609
+(`linux_dxc_2026_09_28.x86_x64.tar.gz`, SHA-256 `96faadc7…aa39a1`, the digest GitHub publishes
+for that asset) into `build/downloads`, rejects any other hash and unpacks it under
+`build/port/dxc`, as `sdl3.py` does with SDL. `DXC=path` still overrides it; with no network and
+no download a `dxc` on PATH is used with a warning. The binary is not committed (tens of MB,
+platform-specific; the repository holds sources). The pinned compiler's SPIR-V header is
+byte-identical to the hand-extracted one's; `link.py` and `test_vulkan.py` pass with `DXC`
+unset.
