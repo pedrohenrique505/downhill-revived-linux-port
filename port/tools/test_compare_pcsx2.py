@@ -10,9 +10,29 @@ from PIL import Image
 import compare_pcsx2 as compare
 import pcsx2_retail as retail
 import race_compare as race
+from normalize_pcsx2_dump import normalize
 
 
 class CompareTests(unittest.TestCase):
+    def test_modern_dump_normalization_preserves_state_and_packets(self):
+        freeze = bytearray(4194813)
+        struct.pack_into('<I', freeze, 0, 9)
+        freeze[316:348] = bytes(range(32))  # Vertex state.
+        freeze[425:441] = bytes(range(16))  # First VRAM bytes.
+        struct.pack_into('<III?', freeze, 364 + 48, 64, 0, 64, False)
+        header = struct.pack('<9I', 9, len(freeze), 36, 0, 123, 0, 0, 36, 0)
+        tail = bytes(8192) + b'\2' + struct.pack('<I', 4) + b'\1\0'
+        original = struct.pack('<II', 0xFFFFFFFF, len(header)) + header + freeze + tail
+        converted = normalize(original)
+        self.assertEqual(struct.unpack_from('<III', converted), (123, 4194752, 8))
+        self.assertEqual(converted[8+316:8+348], bytes(range(32)))
+        self.assertEqual(converted[8+364:8+380], bytes(range(16)))
+        self.assertEqual(converted[8+4194752:], tail)
+        pending = bytearray(original)
+        struct.pack_into('<I', pending, 8+len(header)+364+56, 32)
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            normalize(pending)
+
     def test_movie_pad_boundaries_and_layout(self):
         events = compare.parse_pad('0:0.02:cross+start,0.01:0.02:triangle')
         with tempfile.TemporaryDirectory() as tmp:

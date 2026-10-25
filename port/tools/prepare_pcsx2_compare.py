@@ -177,6 +177,23 @@ static void DhdComparisonInput()
         }
     }
     if (!enabled) return;
+    // Optional fixed-field retail GS input capture, independent of race state.
+    // Used for title/menu checks; no game memory or input is modified here.
+    if (const char* directory = std::getenv("DHD_COMPARE_GSDUMP")) {
+        static bool requested = false;
+        const char* at = std::getenv("DHD_COMPARE_GSDUMP_FRAME");
+        if (!requested && at && g_FrameCount >= std::strtoul(at, nullptr, 10)) {
+            requested = true;
+            std::string target = Path::Combine(directory, fmt::format("field-{:06d}.png", g_FrameCount));
+#ifdef _WIN32
+            std::replace(target.begin(), target.end(), '/', '\\');
+#endif
+            MTGS::RunOnGSThread([target]() {
+                GSConfig.GSDumpCompression = GSDumpCompressionMethod::Uncompressed;
+                GSQueueSnapshot(target, 2);
+            });
+        }
+    }
     // DHD_COMPARE_RACE_SEED: the race seed the port pins with DHD_RACE_SEED (hle_race_seed). The
     // race reads it from timer 0 (0x0016B910: jal func_00238F10; nop), so it follows menu timing;
     // once the game is loaded that call becomes lui/ori of the value, as the port's patch does.
@@ -378,7 +395,7 @@ def replace_once(path, old, new):
 
 
 def patch_source(source=SOURCE):
-    # Reset only this adapter's four downloaded upstream files, never a user's
+    # Reset only this adapter's downloaded upstream files, never a user's
     # project file. Reapplying produces identical source even if hooks changed.
     for relative in ('pcsx2/VMManager.cpp', 'pcsx2/MTGS.cpp',
                      'pcsx2/GS/Renderers/Common/GSRenderer.cpp', 'pcsx2/GS/GSCapture.cpp',

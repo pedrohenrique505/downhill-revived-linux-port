@@ -22,6 +22,7 @@ def main():
     parser.add_argument('capture', type=Path)
     parser.add_argument('--pcsx2', type=Path, default=ROOT / 'build/port/compare-pcsx2-build/bin/pcsx2-gsrunner')
     parser.add_argument('--replay', type=Path, default=ROOT / 'build/port/gs-replay/replay')
+    parser.add_argument('--pcsx2-capture', type=Path, help='original retail dump when capture is a normalized v8 copy')
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--window', action='store_true', help='use X11 when surfaceless EGL is unavailable')
     args = parser.parse_args()
@@ -41,11 +42,14 @@ def main():
         [str(args.replay.resolve()), str(args.capture), str(args.out / 'exact')],
         [str(args.pcsx2.resolve()), '-window' if args.window else '-surfaceless', '-renderer', 'sw', '-loop', '1',
          '-dump', 'f', '-dumprangef', f'0,{len(states)},1', '-dumpdir', str(reference),
-         '--', str(args.capture)],
+         '--', str((args.pcsx2_capture or args.capture).resolve())],
     ]
     for i, command in enumerate(commands):
         if i == 1:
             (args.out / 'reference.readbacks').touch()
+            config = args.out / 'pcsx2-config'
+            config.mkdir()
+            env['XDG_CONFIG_HOME'] = str(config)
             env['DHD_COMPARE_READBACKS'] = str(args.out / 'reference.readbacks')
         with (args.out / f'run-{i}.log').open('w') as log:
             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
@@ -75,6 +79,8 @@ def main():
         scores.append(score)
         print(f'field={field} MAE={score["mae"]:.9f} max={score["max_channel_error"]} pixels_over_16={len(xs)}')
     result = dict(capture=str(args.capture), capture_sha256=sha256(args.capture),
+                  reference_capture=str((args.pcsx2_capture or args.capture).resolve()),
+                  reference_capture_sha256=sha256(args.pcsx2_capture or args.capture),
                   pcsx2_sha256=sha256(args.pcsx2), replay_sha256=sha256(args.replay),
                   scope='GS replay, not independent retail boot', fields=scores)
     exact_reads = (args.out / 'exact.readbacks').read_bytes()

@@ -1979,3 +1979,17 @@ immediate/deferred FIFO reads in order (capture test red before / green after), 
 Linux race-clock captures work. Live GO+10 s readbacks match PCSX2 byte for byte;
 the updated build completes a bounded race at 59.062 fields/s. Independent retail
 boot/GS-stream checks continue; no final issue acceptance is claimed.
+
+Finding 080 final sampled renderer checks: independent retail PCSX2 GS streams
+cover title, rider menu, GO+0.5 s and GO+10 s (five scored fields each). Title,
+menu and riding have no pixel above 16; starting and riding FIFO transcripts
+each match 480 bytes. A second alpha-test bug (bilinear truncation between axes)
+is fixed with red-before/green-after GPU fixtures. The remaining retail-start
+pixel is traced to PCSX2 Z-plane rounding (1155453 versus exact 1155454); the
+earlier native-stream outlier is PCSX2 left-edge rounding. Both specific
+exceptions retain raw failing scores and proof, without excluded pixels or
+changed tolerances. Final live eight-field race readbacks match 476 bytes, with
+only the explained edge pixel; fields 4220–4280 deliver 59.167 fields/s and exit
+normally. Full independent game-state/camera equality is not established by
+this renderer check. Evidence/report stays in ignored build/port/issue1-picture/;
+the corrected executable is build/port/run/dhd. Matching sources/checks unchanged.

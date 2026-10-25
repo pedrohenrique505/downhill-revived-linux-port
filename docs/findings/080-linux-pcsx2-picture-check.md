@@ -135,6 +135,79 @@ All existing GPU fixtures pass unchanged. This second fix removes the interior
 retail-stream outlier; the complete stream's field 1 maximum falls 47 -> 10.
 A separate doubled pixel in field 3 remains under investigation at this step.
 
+## Independent retail stream results and second reference exception
+
+`normalize_pcsx2_dump.py` converts the v9 freeze envelope produced by current
+PCSX2 to the legacy v8 input understood by the port's replay. It preserves all
+registers, VRAM, GIF path state and packet bytes, removing only v9's completed
+transfer bookkeeping. Incomplete transfers are refused. Its synthetic protocol
+test verifies byte preservation and rejection of an unfinished transfer. Crucially,
+`check_exact_pcsx2_linux.py --pcsx2-capture ORIGINAL.gs` keeps PCSX2 on the
+**original retail dump**; conversion is not shared by both sides of the oracle.
+The original checked crop/alignment algorithm is unchanged.
+
+The adapter's opt-in `DHD_COMPARE_GSDUMP` / `DHD_COMPARE_GSDUMP_FRAME` records
+title/menu GS input without game-memory edits. The first title attempt was still
+an intro movie and is excluded. The accepted title uses the recorded early boot
+pad inputs, neutral before the press that enters rider selection; its reviewed
+capture is the actual title with PRESS X TO START. Menu is the rider selection.
+
+Final clean PCSX2 2.8.2 oracle, final shader, independent retail GS streams:
+
+| Scene | Scored fields | RGB MAE range | Maximum channel error | Display pixels >16 | FIFO transcript |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Title | 5 | 0.148558–0.148803 | 13 | 0 | No reads in stream |
+| Rider menu | 5 | 0.220059–0.220984 | 7 | 0 | No reads in stream |
+| GO+0.5 s | 5 | 0.284915–0.291231 | 50 | 2, explained below | 480 bytes MATCH |
+| GO+10 s | 5 | 0.287194–0.291693 | 15 | 0 | 480 bytes MATCH |
+
+GO+0.5 s field 3's only outlier is GS (383,147), doubled to display (383,294)
+and (383,295). This is **depth rounding**, not the earlier float scanline case.
+Native draw 12,714 uses raw vertices (34815,33321,1177534),
+(34830,33346,1160939), (34782,33330,1152163), XYOFFSET (28672,30984).
+The sample is on the included left edge, 3/8 of the way from vertex 2 to vertex 1.
+Its exact linearly interpolated Z is:
+
+```
+1152163 + (1160939 - 1152163) * 3/8 = 1155454
+```
+
+A preceding overlapping triangle writes that same edge depth, 1155454, on both
+renderers. The exact backend retains 1155454 and passes GEQUAL; PCSX2's floating
+plane setup produces 1155453 and rejects it. A single-triangle reduction preserves
+the outlier. Changing **only ZTST to ALWAYS** changes exactly one byte of the
+diagnostic dump and reduces the picture error to maximum 1. A subsequent aligned
+16-pixel Z24 FIFO read directly measures 1155454 versus 1155453 (both transcripts
+52 bytes, including their length header). This is a reference floating-point
+rounding discrepancy relative to exact linear interpolation, not a port texture,
+coverage or packet-order error. No physical GS measurement is claimed.
+
+The strict checker continues to return failure on that raw pixel comparison,
+and on the earlier traced left-edge example. Neither test is weakened, excluded,
+masked or silently accepted by tooling. These are two specific documented
+reference-side exceptions. The original eight-field reproduction, after both
+shader fixes, retains only the explained GS (474,121) outlier; its final maximum
+is 27 (the bilinear correction changes one background component by one).
+
+Evidence is under `build/port/issue1-picture/`: `retail-*-final-check/result.json`
+and PNG triptychs, original retail dumps and captures, normalized replay inputs,
+`triangle-retail-edge-check/`, `triangle-retail-z-always-check/`, and
+`triangle-retail-z-value-16-check/`. Captures remain ignored and local.
+
+The final live run repeats the original eight-field riding scenario and reaches
+field 4,280 without a crash. Fields 4,220–4,280 measure **59.167 fields/s**; its
+seven real FIFO responses match PCSX2 byte for byte (476 transcript bytes).
+The only picture outlier is the previously explained left-edge sample, maximum
+27. `final-live-check/result.json` retains the raw failure, unchanged threshold
+and full readback result. A local review page is `build/port/issue1-picture/index.html`.
+
+The full Linux build links successfully. Both real runtime capture fixes and
+both shader fixes are in the final executable; `src/` and all retail matching
+tools are unchanged. Existing GS, GPU and capture regressions pass; all ten
+Python comparison/protocol tests pass. Temporary debug prefixes are absent from
+the production port and the rebuilt reference oracle. Windows/D3D11 is not run
+or required for this Linux issue's renderer check.
+
 ## Sources
 
 - [PCSX2 2.8.2 source](https://github.com/PCSX2/pcsx2/tree/v2.8.2), pinned at
@@ -144,6 +217,8 @@ A separate doubled pixel in field 3 remains under investigation at this step.
 - Sony GS User's Manual v6.0, section 3.2.9 / figure 3-7,
   [archived manual](https://github.com/DarrenRainey/PS2-Programming-Docs/blob/master/GS_Users_Manual.pdf).
 - [PCSX2 triangle scanline coverage](https://github.com/PCSX2/pcsx2/blob/v2.8.2/pcsx2/GS/Renderers/SW/GSRasterizer.cpp).
+- [PCSX2 freeze layout](https://github.com/PCSX2/pcsx2/blob/v2.8.2/pcsx2/GS/GSState.cpp)
+  and [dump envelope](https://github.com/PCSX2/pcsx2/blob/v2.8.2/pcsx2/GS/GSDump.cpp).
 
 The public GPL PCSX2 source and its notices remain in the ignored build tree.
 No third-party raster implementation is copied into the port.
