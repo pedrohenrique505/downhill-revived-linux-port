@@ -21,6 +21,10 @@ typedef struct {
     void *mapped;
 } Buffer;
 enum { DISPATCH_SLOTS = 16, SUBMISSIONS = 2, INPUT_SLOTS = DISPATCH_SLOTS * SUBMISSIONS };
+/* A dispatch lasts as long as its longest tile list, walked in order by one
+   workgroup while the others sit idle: fewer, larger batches shorten that
+   chain. D3D11's MAX_DRAWS stays as it is. */
+enum { BATCH_DRAWS = 4096 };
 typedef struct {
     VkInstance instance;
     VkPhysicalDevice physical;
@@ -38,7 +42,7 @@ typedef struct {
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
     Buffer buffers[5]; /* b0, u0, t0, t1, t2, with explicit DXC binding shifts */
-    Primitive pending[MAX_DRAWS];
+    Primitive pending[BATCH_DRAWS];
     Constants state;
     unsigned pending_count, memberships, batch_limit, state_context;
     int dirty, texture_valid, batch_safe;
@@ -456,7 +460,7 @@ int gs_vulkan_init(Gs *g)
         VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (!check(vkCreateFence(p->device, &fence, NULL, &p->fences[bank]), "create fence")) goto fail;
     }
-    const VkDeviceSize sizes[] = {sizeof(Constants), GS_VRAM_SIZE, GS_VRAM_SIZE, MAX_DRAWS*sizeof(Primitive), MAX_BIN_WORDS*4};
+    const VkDeviceSize sizes[] = {sizeof(Constants), GS_VRAM_SIZE, GS_VRAM_SIZE, BATCH_DRAWS*sizeof(Primitive), MAX_BIN_WORDS*4};
     VkDescriptorSetLayoutBinding bindings[5] = {0};
     VkDescriptorBufferInfo buffers[5] = {0};
     for (unsigned i = 0; i < 5; i++) {
@@ -505,9 +509,9 @@ int gs_vulkan_init(Gs *g)
     p->staged = malloc(GS_VRAM_SIZE);
     if (!p->staged) goto fail;
     p->uploaded = p->state_version = UINT64_MAX;
-    p->batch_limit = MAX_DRAWS;
+    p->batch_limit = BATCH_DRAWS;
     const char *batch = getenv("DHD_GS_BATCH");
-    if (batch && atoi(batch) > 0 && atoi(batch) <= MAX_DRAWS) p->batch_limit = (unsigned)atoi(batch);
+    if (batch && atoi(batch) > 0 && atoi(batch) <= BATCH_DRAWS) p->batch_limit = (unsigned)atoi(batch);
     memset(p->texture_dirty, 255, sizeof p->texture_dirty);
     g->stage_pages = stage_pages; g->fetch_pages = fetch_pages;
     g->sync = sync_vram; g->sync_range = sync_range; g->draw = draw; g->flush_draw = flush_draw;
