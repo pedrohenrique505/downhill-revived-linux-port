@@ -9,6 +9,9 @@
 #include "hle.h"
 #include "../gs/gs.h"
 #include "../gs/present.h"
+#ifdef __linux__
+#include "../platform/linux/gpu.h"
+#endif
 #include "timer.h"
 #include "../include/fps.h"
 
@@ -1134,6 +1137,12 @@ void kernel_init(void)
     port_fps_wall_mode(paced);
     host_init();
     gs_reset(&gs);
+#ifdef __linux__
+    if (!gs_vulkan_init(&gs)) {
+        hle_log("Cannot initialize the Vulkan exact renderer (details above).\n");
+        exit(1);
+    }
+#endif
     ps2_mmio_write = dma_mmio_write;
     ps2_intc_read = intc_read;
     intc_stat = 0;

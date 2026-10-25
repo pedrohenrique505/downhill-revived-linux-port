@@ -27,10 +27,10 @@ LINUX = PLATFORM == 'linux'
 # Linux (port/platform/linux): these host files have a POSIX version there; the Win32 calls of the
 # others come from its <windows.h>, included before them with the MSVC C runtime's names.
 LINUX_FILES = {'runtime/memory.c': 'platform/linux/memory.c', 'runtime/fp_trap.c': 'platform/linux/fp_trap.c',
-               'hle/host.c': 'platform/linux/host.c', 'gs/present.c': 'platform/linux/present.c'}
+               'hle/host.c': 'platform/linux/host.c', 'gs/present.c': 'platform/linux/present.c', 'gs/gpu.c': 'platform/linux/gpu.c'}
 # Not on Linux yet: Direct3D 11 (the native renderer, texture packs, the sharp font) and WinHTTP
 # (online, the updater). platform/linux/not_yet.c has inert versions of what the rest calls.
-LINUX_LATER = {'gs/gpu.c', 'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
+LINUX_LATER = { 'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
 LINUX_INCLUDE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'platform', 'linux', 'include')
 # The game's code keeps the stack only 4-aligned, as on Windows (pctarget.py): host functions it
 # calls realign theirs (-mstackrealign) before using 16-byte SSE spills.
@@ -171,6 +171,9 @@ def runtime():
     if aot:
         from vu1_aot import generate
         print('VU1 AOT: %d straight-line blocks' % generate(os.path.join(OUT, 'vu1_aot.inc')))
+    if LINUX:
+        from vulkan_shaders import generate
+        generate(os.path.join(OUT, 'gs_spirv.h'))
     shader = open(os.path.join(ROOT, 'port', 'gs', 'raster.hlsl'), encoding='utf-8').read()
     with open(os.path.join(OUT, 'gs_shader.h'), 'w', encoding='utf-8') as f:
         f.write('static const char gs_shader[] = ' + json.dumps(shader) + ';\n')
@@ -322,7 +325,7 @@ def main():
                         '@' + rsp, *extra, '-Wl,--image-base=0x%X' % IMAGE_BASE, '-Wl,-Map=' + os.path.join(OUT, 'dhd.map'),
                         '-Wl,--warn-unresolved-symbols', '-Wl,-z,muldefs', '-Wl,--error-limit=0',
                         '-Wl,--no-dependent-libraries',  # MSVC's #pragma comment(lib) (online.c: bcrypt)
-                        '-lpthread', '-lm', '-ldl', '-latomic'])  # 64-bit atomics on i386
+                        '-lpthread', '-lm', '-ldl', '-latomic', '-lvulkan'])  # 64-bit atomics on i386
         return run(['clang', '--target=' + HOST_TARGET, '-fuse-ld=lld', '-o', os.path.join(OUT, 'dhd.exe'),
                     '@' + rsp, '-Wl,d3dcompiler.lib', '-Wl,d3d11.lib', '-Wl,dxgi.lib', '-Wl,user32.lib', '-Wl,gdi32.lib', '-Wl,winhttp.lib', '-Wl,ole32.lib', *extra, '-Wl,/map:' + os.path.join(OUT, 'dhd.map'), '-Wl,/subsystem:windows', '-Wl,/entry:mainCRTStartup', '-Wl,/safeseh:no', '-Wl,/demangle:no',
                     '-Wl,/force', '-Wl,/errorlimit:0',

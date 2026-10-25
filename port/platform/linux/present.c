@@ -1,14 +1,14 @@
 /* port/gs/present.c on Linux: the SDL3 window and GS framebuffer scanout.
 
    gs.c decodes GIF packets and transfers; gs_display decodes the selected display circuit into
-   RGBA8, and SDL's renderer scales it into the window at 4:3. Rasterization is still missing:
-   both existing raster backends use Direct3D 11 (gs/gpu.c), which the Linux build excludes.
-   Without a backend installing Gs.draw, primitives are consumed without drawing. The gs_gpu_*
-   capture entry points report no GPU picture, so captures read VRAM through gs_display instead.
+   RGBA8, and SDL's Vulkan renderer scales it into the window at 4:3. The Vulkan
+   compute backend (gpu.c), installed before the game starts, rasterizes into
+   coherent GS VRAM. Scanout and captures synchronize through gs_display.
    Frame pacing is the kernel's
    (pacing_handed/pacing_present), as on Windows. The window's events are handled on the game thread,
    once a field: SDL wants them on the thread that made the window. */
 #include <SDL3/SDL.h>
+#include "sdl_events.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +32,7 @@ static int initialized, disabled, text_on;
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height);  /* port/hle/movie.c */
 
-/* No GPU picture on Linux yet (gs/gpu.c): capture.c and replay.c fall back to gs_display. */
+/* CPU scanout of synchronized Vulkan VRAM; capture.c uses gs_display. */
 int gs_gpu_display(Gs *g, unsigned *width, unsigned *height)
 {
     (void)g, (void)width, (void)height;
@@ -85,7 +85,7 @@ static int init(void)
         fprintf(stderr, "gs: no window: %s\n", SDL_GetError());
         return 0;
     }
-    renderer = SDL_CreateRenderer(window, NULL);
+    renderer = SDL_CreateRenderer(window, "vulkan");
     if (!renderer) {
         fprintf(stderr, "gs: no renderer: %s\n", SDL_GetError());
         return 0;
@@ -165,7 +165,8 @@ void gs_pump_messages(void)
         else SDL_StopTextInput(window);
         text_on = want_text;
     }
-    while (SDL_PollEvent(&e)) {
+    SDL_PumpEvents();
+    while (linux_window_event(&e)) {
         switch (e.type) {
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
