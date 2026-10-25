@@ -28,7 +28,19 @@ SOURCES = ('test_native_replay.c', 'gpu.c', 'native.c', 'gs.c', 'memory.c')
 LINUX = sys.platform.startswith('linux')
 
 
-def build(out, tree):
+def build(out, tree, vulkan=False):
+    if vulkan:
+        from vulkan_shaders import generate
+        generate(out / "gs_spirv.h")
+        sources = [ROOT / "port/gs/test_native_replay.c",
+                   *[tree / "port/gs" / name for name in ("native.c", "gs.c", "memory.c")],
+                   *[tree / "port/platform/linux" / name for name in ("gpu.c", "native_gpu.c", "win32.c")]]
+        exe = out / "test-native-vulkan"
+        subprocess.run(["clang", "-m32", "-O2", "-msse2", "-ffp-contract=off",
+                        "-DDHD_NATIVE_VULKAN", "-I", str(out), "-I", str(tree / "port/include"),
+                        "-I", str(tree / "port/platform/linux/include"),
+                        *map(str, sources), "-o", str(exe), "-lvulkan", "-lm", "-lpthread"], check=True)
+        return exe
     shader = (tree / 'port/gs/raster.hlsl').read_text()
     (out / 'gs_shader.h').write_text(
         'static const char gs_shader[] = ' + json.dumps(shader) + ';\n'
@@ -51,6 +63,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('out', type=Path)
     ap.add_argument('captures', type=Path, nargs='+')
+    ap.add_argument('--vulkan', action='store_true', help='build/run the Linux offscreen Vulkan backend')
     ap.add_argument('--expect', type=Path, help='an earlier summary.txt the pictures must match')
     ap.add_argument('--tree', type=Path, default=ROOT, help='the checkout whose renderer is built (default: this one)')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for the replay (DHD_* are otherwise cleared)')
@@ -59,10 +72,10 @@ def main():
     if ROOT / 'build' not in out.parents:
         ap.error('output must stay below build/')
     out.mkdir(parents=True, exist_ok=True)
-    exe = build(out, args.tree.resolve())
+    exe = build(out, args.tree.resolve(), args.vulkan)
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
     env.update(item.split('=', 1) for item in args.env)
-    runner = ['wine', str(exe)] if LINUX else [str(exe)]
+    runner = ['wine', str(exe)] if LINUX and not args.vulkan else [str(exe)]
     if LINUX:
         env.setdefault('WINEDEBUG', '-all')
     lines = []
@@ -74,9 +87,13 @@ def main():
         lines.append('== ' + name)
         lines += [line for line in run.stdout.splitlines() if line.startswith(('field ', 'readbacks '))]
         lines += [line for line in run.stderr.splitlines() if line.startswith('profile native:')]
+        (prefix.with_suffix('.stderr.txt')).write_text(run.stderr)
         if run.returncode:
-            lines.append(f'exit {run.returncode}')
             sys.stderr.write(run.stderr)
+            return run.returncode
+        if args.vulkan and ('Validation Error' in run.stderr or 'VUID-' in run.stderr):
+            sys.stderr.write(run.stderr)
+            return 1
     summary = '\n'.join(lines) + '\n'
     (out / 'summary.txt').write_text(summary)
     print(f'{sum(line.startswith("field ") for line in lines)} pictures from {len(args.captures)} captures: {out / "summary.txt"}')

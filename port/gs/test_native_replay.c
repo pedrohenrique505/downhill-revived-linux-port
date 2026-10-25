@@ -4,7 +4,13 @@
    answered the same reads (port/tools/test_native_replay.py). The presenter, texture
    replacements and EE scheduler are absent, as in test_native_transfers.c. */
 #define COBJMACROS
+#ifdef DHD_NATIVE_VULKAN
+#include "../platform/linux/gpu.h"
+#include "../platform/linux/native_gpu.h"
+uint32_t *gs_native_picture(Gs *, unsigned *, unsigned *);
+#else
 #include "gpu_win32.h"
+#endif
 #include "present.h"
 #include "gpu.h"
 #include "texpack.h"
@@ -22,6 +28,7 @@ void pacing_handed(double *d, double *b) { *d = *b = 0; }
 void pacing_present(double d, double b) { (void)d; (void)b; }
 int host_widescreen_flat_limit(void) { return 1000; }
 double host_widescreen_aspect(void) { return 16.0 / 9; }
+#ifndef DHD_NATIVE_VULKAN
 UINT gs_swap_chain_flags(void) { return 0; }
 void gs_frame_latency_wait(void) {}
 HRESULT gs_present(IDXGISwapChain *s) { return IDXGISwapChain_Present(s, 0, 0); }
@@ -34,6 +41,15 @@ void texpack_report(void) {}
 int font_sharp_on(void) { return 0; }
 int font_sharp_match(uint64_t t) { return 0; }
 ID3D11ShaderResourceView *font_sharp_view(ID3D11Device *d, const uint32_t *p, unsigned w, unsigned h, uint64_t k) { return NULL; }
+
+#else
+int texpack_available(void) { return 0; }
+TexPackEntry *texpack_find(const Gs *g, unsigned c) { (void)g; (void)c; return NULL; }
+void texpack_field(uint64_t f) { (void)f; }
+void texpack_report(void) {}
+int font_sharp_on(void) { return 0; }
+int font_sharp_match(uint64_t t) { (void)t; return 0; }
+#endif
 
 static FILE *input;
 static void read_bytes(void *p, size_t size)
@@ -84,7 +100,11 @@ static void picture(const char *prefix, unsigned field)
 {
     unsigned w = 0, h = 0;
     ++kernel_vsync_count;
+#ifdef DHD_NATIVE_VULKAN
+    native_vsync(&gs, NULL, &w, &h, 0);
+#else
     gs_native_vsync(&gs, NULL, &w, &h, 0);
+#endif
     uint32_t *pixels = gs_native_picture(&gs, &w, &h);
     if (!pixels) { printf("field %u: none\n", field); return; }
     printf("field %u: %ux%u %016llx\n", field, w, h, (unsigned long long)fnv(0xCBF29CE484222325ull, pixels, (size_t)w * h * 4));
@@ -104,9 +124,13 @@ int main(int argc, char **argv)
     input = fopen(argv[1], "rb"); if (!input) { perror(argv[1]); return 1; }
     _putenv("DHD_RENDER=native");
     gs_reset(&gs); freeze();
+#ifdef DHD_NATIVE_VULKAN
+    if (!gs_vulkan_init(&gs) || !gs_vulkan_native(&gs)) return 2;
+#else
     ID3D11Device *device; ID3D11DeviceContext *context;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, NULL, &context)) ||
         !gs_gpu_init(&gs, device, context) || !gs_gpu_native(&gs)) return 2;
+#endif
     unsigned fields = 0, reads = 0; int type;
     uint64_t readhash = 0xCBF29CE484222325ull;
     while ((type = fgetc(input)) != EOF) {
