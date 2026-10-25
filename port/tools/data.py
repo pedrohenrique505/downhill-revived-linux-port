@@ -24,7 +24,7 @@ usage: python port/tools/data.py   (normally run by port/tools/link.py)"""
 import ast, bisect, glob, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import LABEL_PREFIX as P, PS2_RAM_BASE  # noqa: E402
+from pctarget import LABEL_PREFIX as P, PLATFORM, PS2_RAM_BASE, asm_name  # noqa: E402
 from recomp import data_entries  # noqa: E402
 import recomp  # noqa: E402
 
@@ -33,6 +33,8 @@ VUTEXT = (0x263BC0, 0x26DD00)  # vram of .vutext (config/splat.yaml)
 RAM_END = 0x2000000
 GP = 0x2A40F0  # _gp
 SCRATCHPAD = (0x70000000, 0x70004000)
+# Read-only data sections: COFF ("dr") on Windows, ELF ("a") on Linux.
+RDATA, RO_FLAGS = ('.rodata', '"a"') if PLATFORM == 'linux' else ('.rdata', '"dr"')
 OUT = os.path.join(ROOT, 'build', 'port', 'data')
 FILES = ['data.data.s', 'rodata.rodata.s', 'gcc_except_table.gcc_except_table.s', 'sdata.sdata.s',
          'sbss.sbss.s', 'bss.bss.s']  # PS2 address order
@@ -340,6 +342,8 @@ def forwarding_aliases(wanted):
 
 def alias_directives(aliases):
     if not aliases: return []
+    if PLATFORM == 'linux':  # ELF: linker-script PROVIDEs in aliases.ld (convert_all), as weak
+        return []
     # This object contains only data/directives, hence no unsafe SEH handlers.
     return ['.def @feat.00; .scl 3; .type 0; .endef', '.set @feat.00, 1',
             '.section .drectve,"yn"'] + [
@@ -353,7 +357,7 @@ def convert_all(wanted=()):
     of the first two, {name: address} of the image labels and the fixups."""
     os.makedirs(OUT, exist_ok=True)
     syms, refs, fixups = image_symbols(), set(), Fixups()
-    img = ['.section .ps2img,"dr"', '.p2align 6', '_ps2_image:',
+    img = ['.section .ps2img,%s' % RO_FLAGS, '.p2align 6', '_ps2_image:',
            '.incbin "%s"' % os.path.join(ROOT, 'assets', 'vutext.bin').replace(os.sep, '/')]
     for f in FILES:
         if f not in ZERO:
@@ -361,13 +365,18 @@ def convert_all(wanted=()):
     img += ['_ps2_image_end:']
     out = ['.globl %s_gp' % P, '.set %s_gp, %s' % (P, absolute(GP))]  # the small data's base
     for name, addr in sorted(syms.items()):
-        out += ['.globl %s%s' % (P, name), '.set %s%s, %s' % (P, name, absolute(addr))]
+        out += ['.globl %s' % asm_name(name), '.set %s, %s' % (asm_name(name), absolute(addr))]
     aliases = forwarding_aliases(set(wanted) | refs)
-    for sym in sorted((set(wanted) | refs) - {P + n for n in syms} - aliases.keys()):  # the objects' and the image's
-        m = re.match(r'^(?:D_|\.L)([0-9A-F]+)$', sym[len(P):] if sym.startswith(P) else sym)
+    for sym in sorted((set(wanted) | refs) - {asm_name(n) for n in syms} - aliases.keys()):  # the objects' and the image's
+        m = re.match(r'^(?:D_|\.L|PS2L)([0-9A-F]+)$', sym[len(P):] if sym.startswith(P) else sym)
         if m and (int(m.group(1), 16) & 0xCFFFFFFF < RAM_END or SCRATCHPAD[0] <= int(m.group(1), 16) < SCRATCHPAD[1]):
             out += ['.globl %s' % sym, '.set %s, %s' % (sym, absolute(int(m.group(1), 16)))]
     out += alias_directives(aliases)
+    if PLATFORM == 'linux':
+        # /alternatename on ELF: PROVIDE defines the alias only where nothing else defines the name.
+        # link.py links this file as a linker script with the objects.
+        with open(os.path.join(OUT, 'aliases.ld'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(''.join('PROVIDE(%s = %s);\n' % kv for kv in sorted(aliases.items())))
     paths = []
     for name, lines in (('image.s', img), ('symbols.s', out)):
         dst = os.path.join(OUT, name)
@@ -377,8 +386,25 @@ def convert_all(wanted=()):
     return paths, syms, fixups
 
 
+def elf_section(obj, name):
+    """The raw bytes of one section of an ELF32 object (clang's output for image.s on Linux)."""
+    data = open(obj, 'rb').read()
+    shoff, = struct.unpack_from('<I', data, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 46)
+    def header(k):
+        return struct.unpack_from('<IIIIII', data, shoff + k * shentsize)  # name, type, flags, addr, offset, size
+    names = header(shstrndx)[4]
+    for k in range(shnum):
+        n, _, _, _, offset, size = header(k)
+        if data[names + n:data.index(b'\0', names + n)] == name.encode():
+            return data[offset:offset + size]
+    raise ValueError('%s: no section %s' % (obj, name))
+
+
 def coff_section(obj, name):
     """The raw bytes of one section of a COFF object (clang's output for image.s)."""
+    if PLATFORM == 'linux':
+        return elf_section(obj, name)
     data = open(obj, 'rb').read()
     count, = struct.unpack_from('<H', data, 2)
     optional, = struct.unpack_from('<H', data, 16)
@@ -406,7 +432,7 @@ def write_fixups(obj, fixups, nm):
         raise ValueError('the image is 0x%X bytes, ends at 0x%X, not 0x%X' % (
             len(image), VUTEXT[0] + len(image), IMAGE_END))
     retail = bytearray(retail_image())
-    lines = ['.section .rdata,"dr"', '.p2align 2', '.globl _ps2_fixups', '_ps2_fixups:']
+    lines = ['.section %s,%s' % (RDATA, RO_FLAGS), '.p2align 2', '.globl _ps2_fixups', '_ps2_fixups:']
     words = 0
     for label, operands in fixups:
         for k, value in enumerate(operands):

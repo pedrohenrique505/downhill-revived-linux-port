@@ -44,6 +44,10 @@ CLANG = ['clang', '--target=' + pctarget.TARGET, '-c', '-O' + a.opt, '-w', '-fer
          '-Wno-error=pointer-arith',
          '-I', os.path.join(ROOT, 'port', 'include'), '-I', HEADER_OUT,
          '-I', os.path.join(ROOT, 'include')]
+# Linux: the game's objects use windows-itanium's ABI (pctarget.py) but run on a stack that grows
+# by itself, with no Windows stack probe (_chkstk) for large frames.
+if pctarget.PLATFORM == 'linux':
+    CLANG.append('-mno-stack-arg-probe')
 # Diagnostic builds: canaries in every game frame catch a local buffer overflow at its
 # function's return (port/hle/host.c reports it) instead of a crash at a smashed address.
 if os.environ.get('DHD_STACK_PROTECT'):

@@ -18,7 +18,7 @@ usage: python port/tools/recomp.py NAME...   (normally run by port/tools/link.py
 import glob, json, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import LABEL_PREFIX as P, TARGET  # noqa: E402
+from pctarget import LABEL_PREFIX as P, TARGET, asm_name  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ASM = os.path.join(ROOT, 'asm', 'nonmatchings', 'text')
@@ -914,7 +914,7 @@ def write(name, recompiled, sigs):
         out.append('#include "fps.h"')
     out.append('')
     for s in sorted(fn.symbols):
-        out.append('extern char A_%s[] __asm__("%s%s");' % (c_ident(s), P, s))
+        out.append('extern char A_%s[] __asm__("%s");' % (c_ident(s), asm_name(s)))
     for c in sorted(fn.callees):
         if c in recompiled:
             out.append('void rc_%s(void);' % c)
@@ -990,7 +990,7 @@ def write_scalar_dispatch(sigs=None, path=None):
     lines=['/* Generated scalar callback dispatcher; do not edit. */',
            '#include "recomp.h"','#include "quad_abi.h"']
     for name in sorted(selected):
-        lines.append('extern char scalar_%s[] __asm__("%s%s");' % (c_ident(name),P,name))
+        lines.append('extern char scalar_%s[] __asm__("%s");' % (c_ident(name), asm_name(name)))
     lines += ['int ps2_recomp_scalar_call(uintptr_t target) {']
     for name,sig in sorted(selected.items()):
         args,store=marshal(sig)
