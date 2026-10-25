@@ -2000,4 +2000,7 @@ header (`check_native_portable.py`) and reach the backend through `native_gpu_*`
 backend through `NativeHost`. Checked under Wine (DXVK, Microsoft's d3dcompiler_47) with
 `test_native_replay.py`: 86 pictures from the local captures, readbacks and profile counters are
 the same before and after at scales 1, 2, 4 and window, with diagnostics and with DHD_INTERP.
-The Windows game-state gate on a real dhd.exe is still to be run.
+A real Windows dhd.exe, cross-built on Linux with xwin's MSVC libraries and run under Wine, passes
+`gate_native_renderer.py` before and after with the same race pictures (native and exact arms),
+and `test_native_paths.py` (window, silent movies, sharp and original font, a texture pack) gives
+the same 10 pictures before and after.

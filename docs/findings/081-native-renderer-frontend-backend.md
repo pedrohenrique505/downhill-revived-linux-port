@@ -89,13 +89,44 @@ differ between two runs of the same build too; the pictures the replay reads bac
 
 `test_native_transfers.c` (13 synthetic upload/copy checks) passes before and after under Wine.
 
+## Checked with a Windows dhd.exe
+
+`dhd.exe` is cross-built on Linux: `DHD_PLATFORM=windows` takes the MSVC x86 libraries and the
+Windows SDK from an [xwin](https://github.com/Jake-Shadle/xwin) 0.10.0 splat (`pctarget.py` sets
+`INCLUDE` and `LIB`, as `vcvarsall.bat` does), and SDL3 is built with CMake's Windows cross
+settings and LLVM's `lld-link`, `llvm-ar`, `llvm-rc` and `llvm-mt` (`sdl3.py`). Two worktrees, the
+commit before the split (`ce65794`, with the cross-build change applied) and after (`7fbae06`),
+each built with `build.py` + `link.py` (`DHD_BUILD_VU_AOT=1`, as `build_clean.py`): 3,815 units, no
+errors, 23 SDK stubs as before.
+
+They run under Wine 11.20 in a prefix of their own with DXVK 2.5.3 (SHA-256 as winetricks pins it)
+and the 32-bit `d3dcompiler_47.dll` winetricks now takes from Microsoft's Windows SDK installer
+(`2630bae9681db6a9f6722366f47d055c.cab`). That compiler doesn't know
+`RasterizerOrderedByteAddressBuffer`, so the exact renderer's hardware coverage bridge is off and
+its reference compute path draws (the same in both builds). The race gates
+(`race_compare.launch_port`, `gate_gs_optimization.py`'s menu run) start a `.exe` through `wine`
+off Windows (`compare_pcsx2.port_command`).
+
+- `gate_native_renderer.py`: before (`--record`, the reference) and after both pass. EE state matches
+  the reference at GO+0/2/12/16, the arms match each other through GO+4500, and all 1,778
+  readbacks match through field 9006. The 12 race pictures (6 moments, native and exact arms) are
+  byte-identical before and after. The profile counters agree except for those that grow with
+  the fields shown after the last capture: the gate stops the game on wall time (8,531 against
+  8,575 presented).
+- `test_native_paths.py` (new): runs the game windowed (DXGI flip-model swap chain and its
+  presentation) with `DHD_RENDER=native` and the frame clock, and hashes the pictures saved at
+  fixed fields. Covers the two silent logo movies (the movie picture through the native scanout),
+  the title and main menu in the sharp font and in `font = original`, and the same menus with
+  a texture pack. The pack holds one 2x checker per texture the first menus draw (34), so the
+  replacements' loader threads, WIC decode and samplers are exercised. Before and after give the
+  same 10 pictures; two runs of one build give the same.
+  The movies with sound aren't hashed: their picture follows the sound mixer's clock
+  (`movie_audio`), which moves with wall time, so two runs of the same build differ there.
+
 ## Not checked here
 
-- The game-state gate (`gate_native_renderer.py`) and `DHD_DUMP` pictures from a Windows
-  `dhd.exe`: building one needs the MSVC x86 libraries (`link.py`), which this Linux machine
-  doesn't have. The replay covers the renderer's recording, probe, texture and draw paths; it
-  does not cover the swap chain (no window), texture packs and the sharp font (stubbed in the
-  replay), or movies.
+- Real Windows (the checks above ran under Wine and DXVK, not Microsoft's D3D11 driver stack),
+  exclusive fullscreen, and the movies with sound.
 - `port/tools/test_hw_renderer.py` and `test_runtime.py`'s `test_gpu` build `gpu.c` without the
   native renderer's other symbols (texpack, host, pacing); they failed to link before the split
   too (checked at `ce65794` with winegcc) and are unchanged.

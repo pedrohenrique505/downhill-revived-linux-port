@@ -234,6 +234,24 @@ tools set `DHD_SETTINGS=none`) none of them apply. Tools that drive the game (`D
 names the zip after it and writes `build/release/latest.json` beside it (version, the release
 asset URL, the zip's SHA-256 and size) for the updater; publish both as release assets.
 
+## Windows dhd.exe built on Linux
+
+`DHD_PLATFORM=windows` builds the Windows executable on Linux (finding 081). The MSVC x86 libraries
+and the Windows SDK come from [xwin](https://github.com/Jake-Shadle/xwin), which downloads them from
+Microsoft once you accept their licence:
+
+```sh
+cargo install xwin
+xwin --accept-license --arch x86 splat --output ~/.local/share/xwin   # or set DHD_XWIN
+DHD_PLATFORM=windows python port/tools/build.py
+DHD_PLATFORM=windows python port/tools/link.py
+```
+
+Use a separate checkout or worktree: the objects go to the same `build/port` folders as the Linux
+build's. The executable runs under Wine; for `DHD_RENDER=native` the prefix needs
+[DXVK](https://github.com/doitsujin/dxvk) and Microsoft's 32-bit `d3dcompiler_47.dll`. The race
+gates and `port/tools/test_native_paths.py` start a `.exe` through `wine`.
+
 ## Linux exact renderer (i686)
 
 The Linux port uses Vulkan 1.2 compute for `DHD_RENDER=exact`, with the shared
