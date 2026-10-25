@@ -3,6 +3,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include "../platform/linux/gpu.h"
+static int init_backend(void) { return gs_vulkan_init(&gs); }
+static void batch_option(const char *value) { setenv("DHD_GS_BATCH", value, 1); }
+#else
+#include "gpu_win32.h"
+static ID3D11Device *device;
+static ID3D11DeviceContext *context;
+static int init_backend(void) { return gs_gpu_init(&gs, device, context); }
+static void batch_option(const char *value) { _putenv_s("DHD_GS_BATCH", value); }
+#endif
 
 static unsigned failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL GPU line %d: %s\n", __LINE__, #c); failures++; } } while (0)
@@ -157,13 +168,13 @@ static void fog_blend(void)
     CHECK(at(63,7) == 0x80A05028); /* Equal colors remain equal for every F. */
 }
 
-static void batch_ordering(ID3D11Device *device, ID3D11DeviceContext *context)
+static void batch_ordering(void)
 {
     static uint32_t reference[GS_VRAM_SIZE / 4];
     for (unsigned pass = 0; pass < 2; pass++) {
         gs_gpu_destroy(&gs); gs_reset(&gs);
-        _putenv_s("DHD_GS_BATCH", pass ? "256" : "1");
-        CHECK(gs_gpu_init(&gs, device, context));
+        batch_option(pass ? "256" : "1");
+        CHECK(init_backend());
         gs_write(&gs, GS_FRAME_1, 2u << 16);
         gs_write(&gs, GS_ZBUF_1, 16);
         gs_write(&gs, GS_SCISSOR_1, UINT64_C(127) << 16 | UINT64_C(127) << 48);
@@ -198,9 +209,10 @@ static void batch_ordering(ID3D11Device *device, ID3D11DeviceContext *context)
         if (!pass) memcpy(reference, gs.vram, sizeof reference);
         else CHECK(memcmp(reference, gs.vram, sizeof reference) == 0);
     }
-    _putenv_s("DHD_GS_BATCH", "");
+    batch_option("");
 }
 
+#ifndef __linux__
 static void scanout(void)
 {
     uint32_t pixels[80 * 66];
@@ -234,11 +246,13 @@ static void scanout(void)
     }
 }
 
+#endif
+
 /* TRXDIR 2 on the GPU leaves VRAM exactly as the CPU path does, across formats; rectangles on
    shared pages (here overlapping) stay on the CPU. */
 static int (*gpu_copy)(Gs *);
 static unsigned gpu_copies;
-static int counted_copy(Gs *g) { int done = gpu_copy(g); gpu_copies += done; return done; }
+static int counted_copy(Gs *g) { int done = gpu_copy ? gpu_copy(g) : 0; gpu_copies += done; return done; }
 static void local_copies(void)
 {
     static uint32_t expected[GS_VRAM_SIZE / 4];
@@ -271,7 +285,11 @@ static void local_copies(void)
             else if (memcmp(expected, gs.vram, sizeof expected)) { printf("FAIL local copy %u\n", n); failures++; }
         }
     }
+#ifdef __linux__
+    CHECK(gpu_copies == 0); /* Correctness-first Vulkan uses the ordered CPU transfer fallback. */
+#else
     CHECK(gpu_copies == sizeof copies / sizeof *copies - 1);
+#endif
     gs.local_copy = hook;
 }
 
@@ -319,13 +337,13 @@ static void deferred_reads(void)
 
 int main(void)
 {
-    ID3D11Device *device = NULL;
-    ID3D11DeviceContext *context = NULL;
+#ifndef __linux__
     D3D_FEATURE_LEVEL level;
     HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &level, &context);
     if (FAILED(hr)) { printf("FAIL D3D11 WARP %08lX\n", hr); return 1; }
+#endif
     gs_reset(&gs);
-    if (!gs_gpu_init(&gs, device, context)) return 1;
+    if (!init_backend()) return 1;
     gs_write(&gs, GS_FRAME_1, 1u << 16);
     gs_write(&gs, GS_SCISSOR_1, UINT64_C(63) << 16 | UINT64_C(63) << 48);
     gs_write(&gs, GS_COLCLAMP, 1);
@@ -378,6 +396,10 @@ int main(void)
     gs_write(&gs, GS_PRIM, 1);
     vertex(2,55,1); vertex(9,55,1); gs.sync(&gs);
     CHECK(at(3,55) == 0x80443322 && at(9,55) == 0);
+    /* Half-open line coverage must also exclude the end when travelling left. */
+    gs_write(&gs, GS_PRIM, 1);
+    vertex(17,55,1); vertex(10,55,1); gs.sync(&gs);
+    CHECK(at(17,55) == 0x80443322 && at(11,55) == 0x80443322 && at(10,55) == 0);
     gs_write(&gs, GS_PRIM, 4);
     vertex(2,40,1); vertex(10,40,1); vertex(2,48,1); vertex(10,48,1); gs.sync(&gs);
     CHECK(at(3,41) == 0x80443322 && at(8,46) == 0x80443322);
@@ -475,12 +497,16 @@ int main(void)
     mipmapping();
     depth_precision();
     fog_blend();
-    batch_ordering(device, context);
+    batch_ordering();
+#ifndef __linux__
     scanout();
+#endif
     local_copies();
     deferred_reads();
     gs_gpu_destroy(&gs);
+#ifndef __linux__
     ID3D11DeviceContext_Release(context); ID3D11Device_Release(device);
-    printf("D3D11 WARP raster tests: %u failures\n", failures);
+#endif
+    printf("Exact GPU raster tests: %u failures\n", failures);
     return failures != 0;
 }
