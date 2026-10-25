@@ -269,6 +269,8 @@ enum { BLEND_ZERO = 1, BLEND_ONE = 2, BLEND_SA = 5, BLEND_ISA = 6, BLEND_DA = 7,
 
 /* ---- the frontend (native.c), for the backends ---- */
 
+/* After stopping the render thread and releasing backend resources: report and free frontend storage. */
+void native_destroy(Native *n);
 Native *native_create(void);          /* the renderer's state, before the backend's */
 /* Once the backend is ready: takes over the GS hooks of the exact backend that host belongs to. */
 void native_start(Gs *g, Native *n, NativeHost *host);

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../gs/texpack.h"
+#include "../../gs/font_sharp.h"
 #include "../../hle/splash.h"
 #include "../../net/ws_winhttp.h"
 
@@ -18,6 +20,11 @@ void splash_step(int percent, const char *text) { (void)percent, (void)text; }
 void splash_close(void) {}
 
 int texpack_available(void) { return 0; }
+TexPackEntry *texpack_find(const Gs *g, unsigned c) { (void)g; (void)c; return NULL; }
+void texpack_field(uint64_t field) { (void)field; }
+void texpack_report(void) {}
+int font_sharp_on(void) { return 0; }
+int font_sharp_match(uint64_t tex0) { (void)tex0; return 0; }
 
 struct WsConn { int unused; };
 

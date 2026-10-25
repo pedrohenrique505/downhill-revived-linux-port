@@ -526,7 +526,7 @@ int gs_vulkan_native(Gs *g)
     if (!g || !g->backend || !g->draw) return 0;
     if (native_of(g)) return 1;
     Native *n = native_create(); if (!n) return 0;
-    NativeVk *v = calloc(1, sizeof *v); if (!v) { free(n); return 0; } n->gpu = v;
+    NativeVk *v = calloc(1, sizeof *v); if (!v) { native_destroy(n); return 0; } n->gpu = v;
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "Downhill Revived native GS", .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -555,7 +555,11 @@ int gs_vulkan_native(Gs *g)
     free(devices);
     if (!v->physical) {
         fprintf(stderr, "gs native Vulkan: requires Vulkan 1.2 graphics/compute, dualSrcBlend, depthClamp, RGBA8 and sampled D32\n");
-        vkDestroyInstance(v->instance, NULL); free(v); free(n); return 0;
+        if (v->debug) {
+            PFN_vkDestroyDebugUtilsMessengerEXT destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkDestroyDebugUtilsMessengerEXT");
+            destroy(v->instance, v->debug, NULL);
+        }
+        vkDestroyInstance(v->instance, NULL); free(v); native_destroy(n); return 0;
     }
     float priority = 1;
     VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -654,6 +658,6 @@ void native_vulkan_destroy(Native *n)
     }
     vkDestroyInstance(v->instance, NULL);
     free(v); n->gpu = NULL; n->host->native = NULL;
-    /* The frontend owns its frames/logs and its exit profile; retain it until process exit,
-       matching the Windows frontend's lifetime, but no GPU/thread resources remain. */
+    pthread_cond_destroy(&n->queue_changed);
+    native_destroy(n);
 }

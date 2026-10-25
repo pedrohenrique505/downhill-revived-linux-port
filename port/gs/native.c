@@ -1915,6 +1915,26 @@ static void native_exit_report(void);
 static Native *native_reported;
 static void native_exit_report(void) { if (native_reported) native_profile(native_reported); }
 
+/* Backend shutdown has joined the render thread and freed its textures/device. */
+void native_destroy(Native *n)
+{
+    if (native_reported == n) { native_profile(n); native_reported = NULL; }
+    for (unsigned i = 0; i < NATIVE_FRAMES; i++) {
+        NativeFrame *f = &n->frames[i];
+        native_recycle(f);
+        free(f->vertices); free(f->commands); free(f->converts);
+        free(f->segments); free(f->pair); free(f->movie);
+    }
+    for (unsigned i = 0; i < 2; i++) { free(n->logs[i].draws); free(n->logs[i].states); }
+    if (n->texlog) fclose(n->texlog);
+    if (n->trace_fields) fclose(n->trace_fields);
+    if (n->trace_pictures) fclose(n->trace_pictures);
+    if (n->timer) CloseHandle(n->timer);
+    free(n->usage); free(n->picture); free(n->mixed); free(n->same); free(n->paired);
+    DeleteCriticalSection(&n->context_lock); DeleteCriticalSection(&n->queue_lock);
+    free(n);
+}
+
 /* The picture's filter and shape in the window, from DHD_PRESENT_FILTER and DHD_ASPECT; again
    whenever the PC settings page changes them (gs_native_present_options). 0: the backend failed. */
 int native_present_options(Native *n)
