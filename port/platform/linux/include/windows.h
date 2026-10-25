@@ -219,6 +219,32 @@ void SetLastError(DWORD error);
 /* CPU time of a thread (GetCurrentThread() or a CreateThread handle), 100-ns units. */
 BOOL GetThreadTimes(HANDLE thread, FILETIME *created, FILETIME *exited, FILETIME *kernel, FILETIME *user);
 void ExitProcess(UINT code);
+/* The spin-wait hint (PAUSE). */
+static inline void YieldProcessor(void) { __builtin_ia32_pause(); }
+/* No waitable timers: a caller falls back to Sleep (the native renderer's DHD_INTERP_HZ pacing). */
+#define TIMER_ALL_ACCESS 0x1F0003u
+static inline HANDLE CreateWaitableTimerExW(SECURITY_ATTRIBUTES *sa, const WCHAR *name, DWORD flags, DWORD access)
+{
+    (void)sa, (void)name, (void)flags, (void)access;
+    return NULL;
+}
+static inline BOOL SetWaitableTimer(HANDLE timer, const LARGE_INTEGER *due, LONG period, void *routine, void *argument,
+                                    BOOL resume)
+{
+    (void)timer, (void)due, (void)period, (void)routine, (void)argument, (void)resume;
+    return FALSE;
+}
+
+/* A .bmp file's headers, packed as in <wingdi.h> (diagnostic pictures). */
+#pragma pack(push, 2)
+typedef struct { WORD bfType; DWORD bfSize; WORD bfReserved1, bfReserved2; DWORD bfOffBits; } BITMAPFILEHEADER;
+#pragma pack(pop)
+typedef struct {
+    DWORD biSize; LONG biWidth, biHeight; WORD biPlanes, biBitCount;
+    DWORD biCompression, biSizeImage; LONG biXPelsPerMeter, biYPelsPerMeter; DWORD biClrUsed, biClrImportant;
+} BITMAPINFOHEADER;
+#define BI_RGB 0u
+typedef char dhd_bitmap_header_sizes[sizeof(BITMAPFILEHEADER) == 14 && sizeof(BITMAPINFOHEADER) == 40 ? 1 : -1];
 
 typedef struct {
     WORD wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond, wMilliseconds;
