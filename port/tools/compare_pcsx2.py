@@ -106,6 +106,13 @@ def snapshot_exe(source, directory):
     raise RuntimeError('port executable changed repeatedly during snapshot; retry after linking')
 
 
+def port_command(exe):
+    """The command that runs a port executable: a Windows dhd.exe goes through Wine off Windows
+    (WINEPREFIX with DXVK and d3dcompiler_47 for the native renderer, finding 081)."""
+    exe = str(exe)
+    return ['wine', exe] if os.name != 'nt' and exe.lower().endswith('.exe') else [exe]
+
+
 def stop(process):
     if process.poll() is None:
         if os.name == 'nt':

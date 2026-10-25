@@ -174,7 +174,7 @@ def launch_port(args, directory, race_events, moments):
     log = (directory / 'port.log').open('wb')
     # Above normal: a game or build sharing the machine otherwise starves the port's EE thread, and a
     # run that should take 25 minutes takes hours (port/hle/host.c passes the class to its child).
-    process = subprocess.Popen([str(executable)], cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
+    process = subprocess.Popen(compare.port_command(executable), cwd=directory, env=env, stdout=log, stderr=subprocess.STDOUT,
                                creationflags=getattr(subprocess, 'ABOVE_NORMAL_PRIORITY_CLASS', 0))
     return process, digest
 

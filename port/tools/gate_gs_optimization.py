@@ -145,7 +145,7 @@ def main():
                         DHD_SND_OFF='1', DHD_NAV='0:triangle|cross', DHD_RACE_SEED=str(rc.RETAIL_RACE_SEED),
                         DHD_SCREENSHOT=str(menu / 'frame'), DHD_CAPTURE_FRAME='600', DHD_CAPTURE_FRAME_INTERVAL='60')
         with (menu / 'run.log').open('wb') as log:
-            process = subprocess.Popen([str(frozen)], cwd=menu, env=menu_env, stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.Popen(rc.compare.port_command(frozen), cwd=menu, env=menu_env, stdout=log, stderr=subprocess.STDOUT)
             wait_menu(process, menu, time.monotonic() + 180)
     failures = []
     def checked(function, *values, **options):
