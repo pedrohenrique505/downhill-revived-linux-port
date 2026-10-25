@@ -11,8 +11,13 @@
 
 #include "memory.h"
 
-/* Defines a C function under the retail name of the SDK function it replaces. */
+/* Defines a C function under the retail name of the SDK function it replaces (with the target's C
+   symbol prefix: '_' on Windows, none on Linux, port/tools/pctarget.py). */
+#ifdef _WIN32
 #define RETAIL(name) __asm__("_" #name)
+#else
+#define RETAIL(name) __asm__(#name)
+#endif
 
 /* Logs to stderr; DHD_LOG set in the environment turns on the verbose messages. */
 void hle_log(const char *fmt, ...);

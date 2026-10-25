@@ -16,6 +16,8 @@ int host_sprintf(char *out, const char *format, ...)
     return result;
 }
 
+#ifdef _WIN32
+/* (Linux's libm has both; there, without SSE4.1, __builtin_floorf would call floorf itself.) */
 float fabsf(float x)
 {
     return __builtin_fabsf(x);
@@ -25,6 +27,7 @@ float floorf(float x)
 {
     return __builtin_floorf(x);
 }
+#endif
 
 /* exception::what() of gcc 2.95's libstdc++ (in the vtables of the game's exception classes) */
 const char *what__C9exception(const void *self)
