@@ -326,8 +326,16 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
                 .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
             vkCmdPipelineBarrier(gpu->commands[gpu->bank], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
-            VkBufferCopy copy = {.size = GS_VRAM_SIZE};
-            vkCmdCopyBuffer(gpu->commands[gpu->bank], gpu->buffers[1].handle, gpu->buffers[2].handle, 1, &copy);
+            /* Only pages written since the last snapshot differ from it: the rest
+               of a full 4 MB copy is bandwidth an integrated GPU can't spare. */
+            VkBufferCopy copies[256];
+            unsigned runs = 0;
+            for (unsigned page = 0; page < 512; page++) {
+                if (!(gpu->texture_dirty[page/32] & (1u << (page&31)))) continue;
+                if (runs && copies[runs-1].srcOffset + copies[runs-1].size == page*8192u) copies[runs-1].size += 8192;
+                else copies[runs++] = (VkBufferCopy){.srcOffset = page*8192u, .dstOffset = page*8192u, .size = 8192};
+            }
+            vkCmdCopyBuffer(gpu->commands[gpu->bank], gpu->buffers[1].handle, gpu->buffers[2].handle, runs, copies);
             if (++gpu->queued == DISPATCH_SLOTS) submit(gpu);
             memset(gpu->texture_dirty, 0, sizeof gpu->texture_dirty);
             break;
