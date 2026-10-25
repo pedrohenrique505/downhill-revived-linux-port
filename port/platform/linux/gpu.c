@@ -1,6 +1,7 @@
 /* Linux exact GS: shared HLSL rasterizer, ordered compute batches over 4 MB VRAM.
-   Host-visible coherent buffers keep the initial implementation explicit: a fence
-   completes each batch before mapped storage is reused. CPU transfers merge only
+   Ordered dispatches share a submission, with separate immutable host inputs.
+   Two fenced banks let CPU preparation overlap GPU execution; a bank is
+   retired before any of its host input storage is reused. CPU transfers merge only
    dirty pages, preserving unrelated uploads and texture feedback snapshots.
    Native/upscaled rendering remains a separate backend. */
 #include "gpu.h"
@@ -19,23 +20,26 @@ typedef struct {
     VkDeviceMemory memory;
     void *mapped;
 } Buffer;
+enum { DISPATCH_SLOTS = 16, SUBMISSIONS = 2, INPUT_SLOTS = DISPATCH_SLOTS * SUBMISSIONS };
 typedef struct {
     VkInstance instance;
     VkPhysicalDevice physical;
     VkDevice device;
     VkQueue queue;
-    VkCommandPool pool;
-    VkCommandBuffer command;
-    VkFence fence;
+    VkCommandPool pools[SUBMISSIONS];
+    VkCommandBuffer commands[SUBMISSIONS];
+    VkFence fences[SUBMISSIONS];
+    unsigned bank, in_flight[SUBMISSIONS];
     VkDescriptorSetLayout layout;
     VkDescriptorPool descriptors;
-    VkDescriptorSet set;
+    VkDescriptorSet sets[INPUT_SLOTS];
+    VkDeviceSize strides[5];
+    unsigned queued;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
     Buffer buffers[5]; /* b0, u0, t0, t1, t2, with explicit DXC binding shifts */
     Primitive pending[MAX_DRAWS];
     Constants state;
-    uint32_t *bin_data;
     unsigned pending_count, memberships, batch_limit, state_context;
     int dirty, texture_valid, batch_safe;
     uint64_t uploaded, state_version, texture_key, clamp_key, tex1_key, mip_key[2];
@@ -57,7 +61,8 @@ static int create_buffer(Gpu *p, unsigned index, VkDeviceSize size)
 {
     Buffer *b = &p->buffers[index];
     VkBufferCreateInfo info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size, .usage = index ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        .size = size, .usage = (index ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if (!check(vkCreateBuffer(p->device, &info, NULL, &b->handle), "create buffer")) return 0;
     VkMemoryRequirements requirements;
@@ -87,11 +92,58 @@ static int create_buffer(Gpu *p, unsigned index, VkDeviceSize size)
     return 1;
 }
 
-/* Same ordered 8x8 tile lists as the D3D11 reference; packed writes use shader
-   atomics (exclusive-word optimization is deliberately disabled in this build). */
+/* Host input slices belong to one bank until its fence signals. Shared VRAM
+   and texture snapshots stay ordered on the same Vulkan queue. */
+static void retire(Gpu *p, unsigned bank)
+{
+    if (!p->in_flight[bank]) return;
+    require(vkWaitForFences(p->device, 1, &p->fences[bank], VK_TRUE, UINT64_MAX), "wait compute");
+    p->in_flight[bank] = 0;
+}
+
+static void begin_commands(Gpu *p)
+{
+    if (p->queued) return;
+    retire(p, p->bank);
+    require(vkResetCommandPool(p->device, p->pools[p->bank], 0), "reset commands");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    require(vkBeginCommandBuffer(p->commands[p->bank], &begin), "begin commands");
+}
+
+/* Dispatches and snapshot copies remain FIFO-ordered across both banks on
+   the same queue. Host access drains both fences; capacity submits without a
+   wait so the next bank can be prepared while this one executes. */
+static void submit(Gpu *p)
+{
+    if (!p->queued) return;
+    VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(p->commands[p->bank], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &barrier, 0, NULL, 0, NULL);
+    require(vkEndCommandBuffer(p->commands[p->bank]), "end commands");
+    require(vkResetFences(p->device, 1, &p->fences[p->bank]), "reset fence");
+    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &p->commands[p->bank]};
+    require(vkQueueSubmit(p->queue, 1, &submit, p->fences[p->bank]), "submit compute");
+    p->in_flight[p->bank] = 1;
+    p->queued = 0;
+    p->bank = (p->bank+1) % SUBMISSIONS;
+}
+
+static void drain(Gpu *p)
+{
+    submit(p);
+    for (unsigned bank = 0; bank < SUBMISSIONS; bank++) retire(p, bank);
+}
+
+/* Same ordered 8x8 tile lists and independent-pixel proof as D3D11. Packed
+   writes retain atomics; only proven full-word owners use ordinary stores. */
 static void flush(Gpu *p)
 {
     if (!p->pending_count) return;
+    if (!p->queued) retire(p, p->bank);
+    unsigned slot = p->bank*DISPATCH_SLOTS + p->queued;
     unsigned x0 = 2048, y0 = 2048, x1 = 0, y1 = 0;
     for (unsigned i = 0; i < p->pending_count; i++) {
         const uint32_t *b = p->pending[i].bounds;
@@ -101,7 +153,7 @@ static void flush(Gpu *p)
         if ((b[1]+b[3]-1)/8 > y1) y1 = (b[1]+b[3]-1)/8;
     }
     unsigned width = x1-x0+1, height = y1-y0+1, tiles = width*height;
-    uint32_t *bins = p->bin_data;
+    uint32_t *bins = (uint32_t *)((uint8_t *)p->buffers[4].mapped + slot*p->strides[4]);
     memset(bins, 0, tiles*8);
     for (unsigned pass = 0; pass < 2; pass++) {
         for (unsigned i = 0; i < p->pending_count; i++) {
@@ -122,30 +174,19 @@ static void flush(Gpu *p)
     }
     p->state.bounds[0] = x0*8; p->state.bounds[1] = y0*8;
     p->state.bounds[2] = width*8; p->state.bounds[3] = height*8;
-    p->state.info[0] = width; p->state.info[1] = 0;
-    memcpy(p->buffers[0].mapped, &p->state, sizeof p->state);
-    memcpy(p->buffers[3].mapped, p->pending, p->pending_count*sizeof(Primitive));
-    require(vkResetCommandPool(p->device, p->pool, 0), "reset commands");
-    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    require(vkBeginCommandBuffer(p->command, &begin), "begin commands");
+    p->state.info[0] = width; p->state.info[1] = p->batch_safe ? 1 : 0;
+    memcpy((uint8_t *)p->buffers[0].mapped + slot*p->strides[0], &p->state, sizeof p->state);
+    memcpy((uint8_t *)p->buffers[3].mapped + slot*p->strides[3], p->pending, p->pending_count*sizeof(Primitive));
+    begin_commands(p);
     VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT};
-    vkCmdPipelineBarrier(p->command, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(p->commands[p->bank], VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
-    vkCmdBindPipeline(p->command, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
-    vkCmdBindDescriptorSets(p->command, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline_layout, 0, 1, &p->set, 0, NULL);
-    vkCmdDispatch(p->command, width, height, 1);
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(p->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-        0, 1, &barrier, 0, NULL, 0, NULL);
-    require(vkEndCommandBuffer(p->command), "end commands");
-    require(vkResetFences(p->device, 1, &p->fence), "reset fence");
-    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &p->command};
-    require(vkQueueSubmit(p->queue, 1, &submit, p->fence), "submit compute");
-    require(vkWaitForFences(p->device, 1, &p->fence, VK_TRUE, UINT64_MAX), "wait compute");
+    vkCmdBindPipeline(p->commands[p->bank], VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
+    vkCmdBindDescriptorSets(p->commands[p->bank], VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline_layout, 0, 1, &p->sets[slot], 0, NULL);
+    vkCmdDispatch(p->commands[p->bank], width, height, 1);
+    if (++p->queued == DISPATCH_SLOTS) submit(p);
     p->pending_count = p->memberships = 0;
 }
 static void flush_draw(Gs *g) { flush(g->backend); }
@@ -155,6 +196,7 @@ static void sync_vram(Gs *g)
     Gpu *p = g->backend;
     if (!p->dirty) return;
     flush(p);
+    drain(p);
     for (unsigned page = 0; page < 512; page++)
         if (p->cpu_dirty[page/32] & (1u << (page&31)))
             memcpy((uint8_t *)g->vram+page*8192, (uint8_t *)p->buffers[1].mapped+page*8192, 8192);
@@ -163,14 +205,31 @@ static void sync_vram(Gs *g)
 }
 static void sync_range(Gs *g, unsigned address, unsigned bytes)
 {
-    (void)address; (void)bytes;
-    sync_vram(g);
+    Gpu *p = g->backend;
+    if (!p->dirty || !bytes) return;
+    if (address >= GS_VRAM_SIZE || bytes > GS_VRAM_SIZE-address) {
+        sync_vram(g);
+        return;
+    }
+    unsigned first = address/8192, last = (address+bytes-1)/8192;
+    unsigned any = 0;
+    for (unsigned page = first; page <= last; page++)
+        any |= p->cpu_dirty[page/32] & (1u << (page&31));
+    if (!any) return;
+    flush(p);
+    drain(p);
+    for (unsigned page = first; page <= last; page++)
+        if (p->cpu_dirty[page/32] & (1u << (page&31))) {
+            memcpy((uint8_t *)g->vram+page*8192, (uint8_t *)p->buffers[1].mapped+page*8192, 8192);
+            p->cpu_dirty[page/32] &= ~(1u << (page&31));
+        }
 }
 
 static void stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[16])
 {
     Gpu *p = g->backend;
     flush(p);
+    drain(p);
     for (unsigned i = 0; i < 16; i++) staged[i] = want[i] & p->cpu_dirty[i];
     for (unsigned page = 0; page < 512; page++)
         if (staged[page/32] & (1u << (page&31)))
@@ -188,6 +247,7 @@ static void upload_pages(Gs *g)
     Gpu *p = g->backend;
     if (p->uploaded == g->pixels_written) return;
     flush(p);
+    drain(p);
     unsigned any = 0;
     for (unsigned i = 0; i < 16; i++) any |= g->host_dirty[i];
     if (p->uploaded == UINT64_MAX || !any) memset(g->host_dirty, 255, sizeof g->host_dirty);
@@ -260,7 +320,15 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
         texture_pages(gpu, g, ctxt);
         for (unsigned i = 0; i < 16; i++) if (gpu->texture_pages[i] & gpu->texture_dirty[i]) {
             flush(gpu);
-            memcpy(gpu->buffers[2].mapped, gpu->buffers[1].mapped, GS_VRAM_SIZE);
+            begin_commands(gpu);
+            VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            vkCmdPipelineBarrier(gpu->commands[gpu->bank], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+            VkBufferCopy copy = {.size = GS_VRAM_SIZE};
+            vkCmdCopyBuffer(gpu->commands[gpu->bank], gpu->buffers[1].handle, gpu->buffers[2].handle, 1, &copy);
+            if (++gpu->queued == DISPATCH_SLOTS) submit(gpu);
             memset(gpu->texture_dirty, 0, sizeof gpu->texture_dirty);
             break;
         }
@@ -293,8 +361,10 @@ void gs_gpu_destroy(Gs *g)
         if (p->pipeline_layout) vkDestroyPipelineLayout(p->device, p->pipeline_layout, NULL);
         if (p->descriptors) vkDestroyDescriptorPool(p->device, p->descriptors, NULL);
         if (p->layout) vkDestroyDescriptorSetLayout(p->device, p->layout, NULL);
-        if (p->fence) vkDestroyFence(p->device, p->fence, NULL);
-        if (p->pool) vkDestroyCommandPool(p->device, p->pool, NULL);
+        for (unsigned bank = 0; bank < SUBMISSIONS; bank++) {
+            if (p->fences[bank]) vkDestroyFence(p->device, p->fences[bank], NULL);
+            if (p->pools[bank]) vkDestroyCommandPool(p->device, p->pools[bank], NULL);
+        }
         for (unsigned i = 0; i < 5; i++) {
             Buffer *b = &p->buffers[i];
             if (b->mapped) vkUnmapMemory(p->device, b->memory);
@@ -369,18 +439,23 @@ int gs_vulkan_init(Gs *g)
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue, .pEnabledFeatures = &features};
     if (!check(vkCreateDevice(p->physical, &device, NULL, &p->device), "create device")) goto fail;
     vkGetDeviceQueue(p->device, family, 0, &p->queue);
-    VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
-    if (!check(vkCreateCommandPool(p->device, &pool, NULL, &p->pool), "create command pool")) goto fail;
-    VkCommandBufferAllocateInfo commands = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = p->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    if (!check(vkAllocateCommandBuffers(p->device, &commands, &p->command), "allocate commands")) goto fail;
-    VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (!check(vkCreateFence(p->device, &fence, NULL, &p->fence), "create fence")) goto fail;
+    for (unsigned bank = 0; bank < SUBMISSIONS; bank++) {
+        VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
+        if (!check(vkCreateCommandPool(p->device, &pool, NULL, &p->pools[bank]), "create command pool")) goto fail;
+        VkCommandBufferAllocateInfo commands = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = p->pools[bank], .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        if (!check(vkAllocateCommandBuffers(p->device, &commands, &p->commands[bank]), "allocate commands")) goto fail;
+        VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (!check(vkCreateFence(p->device, &fence, NULL, &p->fences[bank]), "create fence")) goto fail;
+    }
     const VkDeviceSize sizes[] = {sizeof(Constants), GS_VRAM_SIZE, GS_VRAM_SIZE, MAX_DRAWS*sizeof(Primitive), MAX_BIN_WORDS*4};
     VkDescriptorSetLayoutBinding bindings[5] = {0};
     VkDescriptorBufferInfo buffers[5] = {0};
     for (unsigned i = 0; i < 5; i++) {
-        if (!create_buffer(p, i, sizes[i])) goto fail;
+        VkDeviceSize alignment = i ? properties.limits.minStorageBufferOffsetAlignment : properties.limits.minUniformBufferOffsetAlignment;
+        p->strides[i] = (sizes[i]+alignment-1)/alignment*alignment;
+        unsigned slots = (i == 0 || i == 3 || i == 4) ? INPUT_SLOTS : 1;
+        if (!create_buffer(p, i, p->strides[i]*slots)) goto fail;
         bindings[i] = (VkDescriptorSetLayoutBinding){.binding = i,
             .descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
@@ -389,18 +464,23 @@ int gs_vulkan_init(Gs *g)
     VkDescriptorSetLayoutCreateInfo layout = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 5, .pBindings = bindings};
     if (!check(vkCreateDescriptorSetLayout(p->device, &layout, NULL, &p->layout), "create descriptors")) goto fail;
-    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, INPUT_SLOTS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4*INPUT_SLOTS}};
     VkDescriptorPoolCreateInfo descriptors = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = pool_sizes};
+        .maxSets = INPUT_SLOTS, .poolSizeCount = 2, .pPoolSizes = pool_sizes};
     if (!check(vkCreateDescriptorPool(p->device, &descriptors, NULL, &p->descriptors), "create descriptor pool")) goto fail;
-    VkDescriptorSetAllocateInfo set = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = p->descriptors, .descriptorSetCount = 1, .pSetLayouts = &p->layout};
-    if (!check(vkAllocateDescriptorSets(p->device, &set, &p->set), "allocate descriptors")) goto fail;
-    VkWriteDescriptorSet writes[5] = {0};
-    for (unsigned i = 0; i < 5; i++) writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = p->set, .dstBinding = i, .descriptorCount = 1, .descriptorType = bindings[i].descriptorType,
-        .pBufferInfo = &buffers[i]};
-    vkUpdateDescriptorSets(p->device, 5, writes, 0, NULL);
+    for (unsigned slot = 0; slot < INPUT_SLOTS; slot++) {
+        VkDescriptorSetAllocateInfo set = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = p->descriptors, .descriptorSetCount = 1, .pSetLayouts = &p->layout};
+        if (!check(vkAllocateDescriptorSets(p->device, &set, &p->sets[slot]), "allocate descriptors")) goto fail;
+        VkWriteDescriptorSet writes[5] = {0};
+        for (unsigned i = 0; i < 5; i++) {
+            buffers[i].offset = (i == 0 || i == 3 || i == 4) ? slot*p->strides[i] : 0;
+            writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = p->sets[slot], .dstBinding = i, .descriptorCount = 1, .descriptorType = bindings[i].descriptorType,
+                .pBufferInfo = &buffers[i]};
+        }
+        vkUpdateDescriptorSets(p->device, 5, writes, 0, NULL);
+    }
     VkPipelineLayoutCreateInfo pipeline_layout = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &p->layout};
     if (!check(vkCreatePipelineLayout(p->device, &pipeline_layout, NULL, &p->pipeline_layout), "create pipeline layout")) goto fail;
@@ -416,7 +496,6 @@ int gs_vulkan_init(Gs *g)
     if (!check(result, "create compute pipeline")) goto fail;
     p->staged = malloc(GS_VRAM_SIZE);
     if (!p->staged) goto fail;
-    p->bin_data = p->buffers[4].mapped;
     p->uploaded = p->state_version = UINT64_MAX;
     p->batch_limit = MAX_DRAWS;
     const char *batch = getenv("DHD_GS_BATCH");

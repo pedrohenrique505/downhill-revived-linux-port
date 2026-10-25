@@ -1924,3 +1924,15 @@ race sample: 11.50 fields/buffer changes/clock ticks per second. PCSX2 software
 GS replays give RGB MAE 0.3685 (menu) and 0.3808 (race), with two race pixels
 exceeding 16. D3D11/independent retail parity and those outliers remain open;
 issue #1 is not fully accepted. No game data/captures committed, matching source unchanged.
+
+Linux exact performance continuation (2026-10-24, finding 077, fork issue #1):
+selective dirty-page readback, ordered 16-command submissions with immutable input
+slots, GPU texture snapshots and the shared shader's proven early-Z/word-store
+paths improve menu raster replay 53.217 -> 31.713 ms/field and race replay
+80.937 -> 42.999 (five interleaved pairs). All eleven local captures retain
+byte-identical full VRAM; shared GPU/GS tests and the new slot-reuse regression
+pass, with a failing corrupted-slot control. Windowed monitored menu sample:
+6.065 -> 8.782 actual menu frames and fields/s. Updated Linux executable linked
+and copied to build/port/run/dhd. Real-time play and issue acceptance remain
+open; replay timings exclude EE/VU/game work. No independent retail/D3D11 parity
+or new image MATCH claimed; src/ and strict checks are unchanged.

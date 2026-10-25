@@ -168,6 +168,28 @@ static void fog_blend(void)
     CHECK(at(63,7) == 0x80A05028); /* Equal colors remain equal for every F. */
 }
 
+#ifdef __linux__
+/* Cross submission-slot reuse with changing constants and primitives. No CPU
+   read may accidentally drain the queue before all 48 points are recorded. */
+static void queued_states(void)
+{
+    gs_gpu_destroy(&gs); gs_reset(&gs);
+    CHECK(init_backend());
+    gs_write(&gs, GS_ZBUF_1, UINT64_C(1) << 32);
+    gs_write(&gs, GS_COLCLAMP, 1);
+    gs_write(&gs, GS_PRIM, 0);
+    for (unsigned i = 0; i < 48; i++) {
+        gs_write(&gs, GS_FRAME_1, 1u << 16 | (i & 1 ? UINT64_C(0xFF000000) << 32 : 0));
+        gs_write(&gs, GS_SCISSOR_1, i | (uint64_t)i << 16);
+        gs_write(&gs, GS_RGBAQ, 0x80112200 | i);
+        vertex(i, 0, 1);
+    }
+    gs.sync(&gs);
+    for (unsigned i = 0; i < 48; i++)
+        CHECK(at(i,0) == ((i & 1 ? 0x00112200 : 0x80112200) | i));
+}
+#endif
+
 static void batch_ordering(void)
 {
     static uint32_t reference[GS_VRAM_SIZE / 4];
@@ -503,6 +525,9 @@ int main(void)
 #endif
     local_copies();
     deferred_reads();
+#ifdef __linux__
+    queued_states();
+#endif
     gs_gpu_destroy(&gs);
 #ifndef __linux__
     ID3D11DeviceContext_Release(context); ID3D11Device_Release(device);

@@ -1,7 +1,13 @@
 /* Diagnostic replay of our legacy GS captures, without running the EE/VU. */
 #define COBJMACROS
+#ifdef __linux__
+#include "../platform/linux/gpu.h"
+#include <time.h>
+#else
 #include "gpu_win32.h"
+#endif
 #include "present.h"
+#include "gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,7 +61,12 @@ static void freeze(void)
 static void image(const char *prefix, unsigned field)
 {
     static uint32_t pixels[1024 * 1024]; unsigned w, h;
+#ifdef __linux__
+    if (!gs_display(&gs, pixels, &w, &h)) return;
+#else
     if (!gs_gpu_display(&gs, &w, &h) || !gs_gpu_capture(&gs, pixels)) return;
+#endif
+    if (getenv("DHD_REPLAY_NO_IMAGES")) return;
     char name[1024]; snprintf(name, sizeof name, "%s-%03u.ppm", prefix, field);
     FILE *f = fopen(name, "wb"); if (!f) { perror(name); exit(1); }
     fprintf(f, "P6\n%u %u\n255\n", w,h);
@@ -71,9 +82,19 @@ int main(int argc, char **argv)
     if (argc != 3) { fprintf(stderr, "Usage: replay.exe capture.gs output-prefix\n"); return 1; }
     input = fopen(argv[1], "rb"); if (!input) { perror(argv[1]); return 1; }
     gs_reset(&gs); freeze();
+#ifdef __linux__
+    if (!gs_vulkan_init(&gs)) return 1;
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#else
     ID3D11Device *device; ID3D11DeviceContext *context; D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
         D3D11_SDK_VERSION, &device, &level, &context)) || !gs_gpu_init(&gs, device, context)) return 1;
+#endif
+#ifdef __linux__
+    char read_name[1024]; snprintf(read_name, sizeof read_name, "%s.readbacks", argv[2]);
+    FILE *readbacks = fopen(read_name, "wb"); if (!readbacks) { perror(read_name); return 1; }
+#endif
     unsigned fields = 0; int type;
     while ((type = fgetc(input)) != EOF) {
         if (type == 0) {
@@ -87,11 +108,34 @@ int main(int argc, char **argv)
             image(argv[2], fields++);
         } else if (type == 2) {
             unsigned count = read32(); uint8_t *data = malloc((size_t)count * 16);
-            if (!data) return 1; gs_read_image(&gs, data, count * 16); free(data);
+            if (!data) return 1;
+            size_t bytes = gs_read_image(&gs, data, (size_t)count * 16);
+#ifdef __linux__
+            uint32_t size = (uint32_t)bytes;
+            if (fwrite(&size, sizeof size, 1, readbacks) != 1 || fwrite(data, 1, bytes, readbacks) != bytes) return 1;
+#else
+            (void)bytes;
+#endif
+            free(data);
         } else if (type == 3) registers();
         else { fprintf(stderr, "Unknown GS record %d\n", type); return 1; }
     }
-    fclose(input); gs_gpu_destroy(&gs);
+    fclose(input);
+#ifdef __linux__
+    if (fclose(readbacks)) return 1;
+    if (!fields) { fprintf(stderr, "GS replay contains no fields\n"); return 1; }
+    gs.sync(&gs);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec-start.tv_sec)*1000.0 + (end.tv_nsec-start.tv_nsec)/1e6;
+    printf("Replay: fields=%u raster_ms=%.3f ms_per_field=%.3f\n", fields, elapsed, elapsed/fields);
+    char name[1024]; snprintf(name, sizeof name, "%s.vram", argv[2]);
+    FILE *vram = fopen(name, "wb"); if (!vram) { perror(name); return 1; }
+    if (fwrite(gs.vram, 1, GS_VRAM_SIZE, vram) != GS_VRAM_SIZE) return 1;
+    fclose(vram);
+#endif
+    gs_gpu_destroy(&gs);
+#ifndef __linux__
     ID3D11DeviceContext_Release(context); ID3D11Device_Release(device);
+#endif
     printf("Replayed %u fields\n", fields); return 0;
 }
