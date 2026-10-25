@@ -1903,3 +1903,10 @@ pause/results TRY AGAIN/RE-START/NEW LEVEL, same/changed track and countdown res
 physical skip PASS. Goggles and pre-load level chooser now keep 4:3 proportions in widescreen; final
 native 60-fps gate MATCH, all 14 EE checks and 1,123 readbacks/Z reads through GS field 9,044. No
 push/release. 
+
+Linux window validation (2026-10-24, finding 075, fork issue #1): the SDL3 Wayland/OpenGL window
+starts, but exact scanout is black at fields 120/600. Live `Gs.draw == NULL`: the Linux link excludes
+the D3D11 raster backend and installs no replacement (fork issue #12). About 59 fields/s without
+rasterization is not rendering performance. SIGINT exits promptly; close-button automation,
+keyboard/controller play and retail picture comparisons remain unverified or blocked. The
+presenter comment now describes this limitation accurately. No raster backend fix is claimed.

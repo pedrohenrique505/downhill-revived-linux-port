@@ -1,9 +1,11 @@
-/* port/gs/present.c on Linux: the window (SDL3) and the exact renderer's picture in it.
+/* port/gs/present.c on Linux: the SDL3 window and GS framebuffer scanout.
 
-   The exact renderer draws on the CPU (gs.c), gs_display decodes the selected display circuit into
-   RGBA8, and SDL's renderer (OpenGL or Vulkan) scales it into the window at 4:3. The native renderer
-   (gs/gpu.c, Direct3D 11) is not on Linux yet; the gs_gpu_* entry points it gives the capture tools
-   report no GPU picture, so they read the exact one. Frame pacing is the kernel's
+   gs.c decodes GIF packets and transfers; gs_display decodes the selected display circuit into
+   RGBA8, and SDL's renderer scales it into the window at 4:3. Rasterization is still missing:
+   both existing raster backends use Direct3D 11 (gs/gpu.c), which the Linux build excludes.
+   Without a backend installing Gs.draw, primitives are consumed without drawing. The gs_gpu_*
+   capture entry points report no GPU picture, so captures read VRAM through gs_display instead.
+   Frame pacing is the kernel's
    (pacing_handed/pacing_present), as on Windows. The window's events are handled on the game thread,
    once a field: SDL wants them on the thread that made the window. */
 #include <SDL3/SDL.h>
