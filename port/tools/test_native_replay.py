@@ -9,7 +9,12 @@ On Linux the Windows test runs under Wine (winegcc builds it against Wine's impo
 The Wine prefix (WINEPREFIX) needs a D3D11 with double-precision shader support (DXVK) and
 Microsoft's d3dcompiler_47.dll: Wine's own compiler can't compile raster.hlsl (finding 081).
 
-usage: python port/tools/test_native_replay.py OUT capture.gs... [--expect OLD/summary.txt]"""
+--tree builds another checkout's renderer (a git worktree of an older commit) with this replay,
+to record the summary a change is compared with; --env runs with a renderer option set
+(DHD_INTERP=1, DHD_SCALE=1...), which the comparison must use on both sides.
+
+usage: python port/tools/test_native_replay.py OUT capture.gs... [--expect OLD/summary.txt]
+       [--tree CHECKOUT] [--env NAME=VALUE]..."""
 import argparse
 import json
 import os
@@ -19,18 +24,20 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCES = ('test_native_replay.c', 'gpu.c', 'gs.c', 'memory.c')
+SOURCES = ('test_native_replay.c', 'gpu.c', 'native.c', 'gs.c', 'memory.c')
 LINUX = sys.platform.startswith('linux')
 
 
-def build(out):
-    shader = (ROOT / 'port/gs/raster.hlsl').read_text()
+def build(out, tree):
+    shader = (tree / 'port/gs/raster.hlsl').read_text()
     (out / 'gs_shader.h').write_text(
         'static const char gs_shader[] = ' + json.dumps(shader) + ';\n'
         'static const char gs_shader_path[] = "port/gs/raster.hlsl";\n')
     exe = out / 'test-native-replay.exe'
-    sources = [str(ROOT / 'port/gs' / name) for name in SOURCES]
-    flags = ['-O2', '-msse2', '-mfpmath=sse', '-ffp-contract=off', '-w', '-I', str(out), '-I', str(ROOT / 'port/gs')]
+    # The replay is this checkout's; the renderer the tree's (native.c only once it exists).
+    sources = [str(ROOT / 'port/gs' / SOURCES[0])]
+    sources += [str(tree / 'port/gs' / name) for name in SOURCES[1:] if (tree / 'port/gs' / name).exists()]
+    flags = ['-O2', '-msse2', '-mfpmath=sse', '-ffp-contract=off', '-w', '-I', str(out), '-I', str(tree / 'port/gs')]
     if LINUX:
         command = ['winegcc', '-m32', '-b', 'i686-windows', *flags, *sources, '-o', str(exe)]
     else:
@@ -45,13 +52,16 @@ def main():
     ap.add_argument('out', type=Path)
     ap.add_argument('captures', type=Path, nargs='+')
     ap.add_argument('--expect', type=Path, help='an earlier summary.txt the pictures must match')
+    ap.add_argument('--tree', type=Path, default=ROOT, help='the checkout whose renderer is built (default: this one)')
+    ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for the replay (DHD_* are otherwise cleared)')
     args = ap.parse_args()
     out = args.out.resolve()
     if ROOT / 'build' not in out.parents:
         ap.error('output must stay below build/')
     out.mkdir(parents=True, exist_ok=True)
-    exe = build(out)
+    exe = build(out, args.tree.resolve())
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
+    env.update(item.split('=', 1) for item in args.env)
     runner = ['wine', str(exe)] if LINUX else [str(exe)]
     if LINUX:
         env.setdefault('WINEDEBUG', '-all')
@@ -63,6 +73,7 @@ def main():
         run = subprocess.run(runner + [str(capture), str(prefix)], cwd=ROOT, env=env, capture_output=True, text=True)
         lines.append('== ' + name)
         lines += [line for line in run.stdout.splitlines() if line.startswith(('field ', 'readbacks '))]
+        lines += [line for line in run.stderr.splitlines() if line.startswith('profile native:')]
         if run.returncode:
             lines.append(f'exit {run.returncode}')
             sys.stderr.write(run.stderr)
