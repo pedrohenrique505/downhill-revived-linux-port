@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import HOST_TARGET, PLATFORM  # noqa: E402
+from pctarget import CROSS, HOST_TARGET, PLATFORM  # noqa: E402
 
 VERSION = '3.4.18'
 URL = 'https://github.com/libsdl-org/SDL/releases/download/release-%s/SDL3-%s.tar.gz' % (VERSION, VERSION)
@@ -124,12 +124,17 @@ def build():
     cmake = tool('cmake', CMAKE_DEFAULT)
     clang = tool('clang')
     cmd = [cmake, '-S', str(src), '-B', str(bld), '-G', 'Ninja',
-           '-DCMAKE_MAKE_PROGRAM=' + os.path.join(ninja.BIN_DIR, 'ninja' if PLATFORM == 'linux' else 'ninja.exe'),
+           '-DCMAKE_MAKE_PROGRAM=' + os.path.join(ninja.BIN_DIR, 'ninja.exe' if sys.platform.startswith('win') else 'ninja'),
            '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_C_COMPILER_TARGET=' + HOST_TARGET,
            '-DCMAKE_CXX_COMPILER=' + clang.replace('clang', 'clang++'), '-DCMAKE_CXX_COMPILER_TARGET=' + HOST_TARGET,
            '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
            '-DCMAKE_C_FLAGS=-msse2', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW']
     cmd += ['-D%s=%s' % kv for kv in sorted(OPTIONS.items())]
+    if CROSS:  # dhd.exe built on Linux (pctarget.py): LLVM's Windows tools, xwin's SDK
+        cmd += ['-DCMAKE_SYSTEM_NAME=Windows', '-DCMAKE_SYSTEM_PROCESSOR=x86', '-DCMAKE_LINKER=lld-link',
+                '-DCMAKE_AR=' + tool('llvm-ar'), '-DCMAKE_RC_COMPILER=' + tool('llvm-rc'),
+                '-DCMAKE_MT=' + tool('llvm-mt'), '-DCMAKE_C_FLAGS=-msse2 -fuse-ld=lld',
+                '-DCMAKE_CXX_FLAGS=-fuse-ld=lld']
     env = dict(os.environ)
     if PLATFORM == 'linux':
         # the 32-bit libraries' pkg-config files (lib32-* packages); the headers are shared

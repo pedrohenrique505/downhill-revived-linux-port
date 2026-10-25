@@ -32,6 +32,18 @@ else:
     HOST_TARGET = 'i686-pc-windows-msvc'
     LABEL_PREFIX = '_'
 
+# dhd.exe built on Linux (DHD_PLATFORM=windows): the MSVC x86 libraries and the Windows SDK come
+# from an xwin splat (https://github.com/Jake-Shadle/xwin: xwin --accept-license --arch x86 splat
+# --output DIR), DHD_XWIN or ~/.local/share/xwin. clang and lld-link find them through INCLUDE
+# and LIB, as after Visual Studio's vcvarsall.bat; a caller's own INCLUDE/LIB are kept.
+CROSS = PLATFORM == 'windows' and not sys.platform.startswith('win')
+if CROSS:
+    XWIN = os.environ.get('DHD_XWIN', os.path.expanduser('~/.local/share/xwin'))
+    os.environ.setdefault('INCLUDE', ';'.join(os.path.join(XWIN, *d) for d in (
+        ('crt', 'include'), ('sdk', 'include', 'ucrt'), ('sdk', 'include', 'um'), ('sdk', 'include', 'shared'))))
+    os.environ.setdefault('LIB', ';'.join(os.path.join(XWIN, *d) for d in (
+        ('crt', 'lib', 'x86'), ('sdk', 'lib', 'um', 'x86'), ('sdk', 'lib', 'ucrt', 'x86'))))
+
 # The emulated PS2 RAM (32 MB) sits at this host address, with the uncached mirrors at
 # 0x20000000/0x30000000 + it (port/runtime/memory.c). Below 0x10000000, so a PS2 DMA address
 # (pointer & 0x0FFFFFFF) is still the host pointer; the exe is linked at IMAGE_BASE, above it all.
