@@ -61,6 +61,9 @@ static uint draw_state;
 #endif
 cbuffer Display : register(b1) { uint4 display_state[3]; };
 cbuffer Copy : register(b2) { uint4 copy_state[3]; };
+#if defined(__spirv__) && defined(DHD_NATIVE)
+[[vk::image_format("rgba8")]]
+#endif
 RWTexture2D<float4> screen : register(u1);
 
 
@@ -675,6 +678,9 @@ Texture2D<float> convert_depth0 : register(t13);
 Texture2D<float> convert_depth1 : register(t14);
 Texture2D<float> convert_depth2 : register(t15);
 Texture2D<float> convert_depth3 : register(t16);
+#ifdef __spirv__
+[[vk::image_format("rgba8")]]
+#endif
 RWTexture2D<float4> native_converted : register(u2);
 
 uint convert_word(uint slot, int3 xy, bool depth, float unit) {

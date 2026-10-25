@@ -48,3 +48,23 @@ requested. Need a working 32-bit VK_LAYER_KHRONOS_validation (including its
 manifest/dependencies). Windows image difference measurements, broader synthetic
 coverage, ordinary link integration, resource/validation audit and race Z-read
 parity still need completion. No issue acceptance or production readiness claimed.
+
+## Local validation tooling and storage formats
+
+Resumed with permission to install tooling without sudo. Arch packages
+lib32-vulkan-validation-layers 1.4.363.0-1 and the matching 64-bit package
+(manifest only) were extracted under build/port/issue15/layers; no system files
+were changed. VK_LAYER_PATH points at the extracted manifest, whose library path
+points to the local i686 .so. ldd reports all runtime dependencies available.
+
+Explicit --validation now requires the Khronos layer on both devices and enables
+VK_LAYER_VALIDATE_SYNC=1. The native debug messenger and both stdout/stderr are
+checked: warnings, errors and VUIDs fail the replay (including undefined-value
+warnings). The initial environment-only check missed stdout warnings; its result
+was insufficient. The stricter test caught screen/native_converted declared as
+Rgba32f but bound to RGBA8_UNORM views. DXC-specific image_format("rgba8")
+attributes fix this, guarded so D3D11 sees unchanged declarations. Reference:
+[DXC SPIR-V image formats](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/SPIR-V.rst).
+The SPIR-V format regression failed before the fix and passes after it.
+Three menu fields now run with explicit validation plus synchronization checks,
+zero warnings/errors, and retain the D3D11 reference's exact RGBA hashes.

@@ -54,6 +54,8 @@ def main():
         words = re.findall(r'0x([0-9a-f]{8})u', header.read_text().split(
             'gs_spirv_%s[]' % entry, 1)[1].split('};', 1)[0])
         assert b''.join(int(w, 16).to_bytes(4, 'little') for w in words) == binary.read_bytes()
+    for entry in ('native_scanout', 'native_convert'):
+        assert re.search(r'OpTypeImage %float 2D [012] 0 0 2 Rgba8', modules[entry]), (entry, 'storage image must match RGBA8 view')
     pixel = modules['native_pixel']
     for output, index in (('SV_Target0', 0), ('SV_Target1', 1)):
         assert 'OpDecorate %%out_var_%s Location 0' % output in pixel

@@ -522,6 +522,8 @@ int gs_vulkan_init(Gs *g)
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "Downhill Revived exact GS", .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    const char *validation_layer = "VK_LAYER_KHRONOS_validation";
+    if (getenv("DHD_VK_VALIDATE")) { instance.enabledLayerCount = 1; instance.ppEnabledLayerNames = &validation_layer; }
     if (!check(vkCreateInstance(&instance, NULL, &p->instance), "create instance")) {
         fprintf(stderr, "gs: install a Vulkan 1.2 driver matching the game's 32-bit architecture (for AMD: lib32-vulkan-radeon)\n");
         goto fail;

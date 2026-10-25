@@ -23,6 +23,7 @@ typedef struct Garbage { struct Garbage *next; Image image; VkFramebuffer frameb
 typedef struct Pipeline { struct Pipeline *next; uint32_t blend; unsigned depth, mask, kind; VkPipeline pipeline; } Pipeline;
 typedef struct {
     VkInstance instance;
+    VkDebugUtilsMessengerEXT debug;
     VkPhysicalDevice physical;
     VkDevice device;
     VkQueue queue;
@@ -514,6 +515,12 @@ static int native_device_supported(VkPhysicalDevice physical, unsigned *family)
         (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { *family = j; found = 1; break; }
     free(q); return found;
 }
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type, const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
+{
+    (void)severity; (void)type; (void)user;
+    fprintf(stderr, "Vulkan validation: %s\n", data->pMessage); return VK_FALSE;
+}
 int gs_vulkan_native(Gs *g)
 {
     if (!g || !g->backend || !g->draw) return 0;
@@ -523,8 +530,23 @@ int gs_vulkan_native(Gs *g)
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "Downhill Revived native GS", .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
-    /* VK_INSTANCE_LAYERS can enable validation, including the offscreen test. */
+    const char *layer = "VK_LAYER_KHRONOS_validation", *extension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkDebugUtilsMessengerCreateInfoEXT debug = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT, .pfnUserCallback = validation_message};
+    if (getenv("DHD_VK_VALIDATE")) {
+        instance.enabledLayerCount = 1; instance.ppEnabledLayerNames = &layer;
+        instance.enabledExtensionCount = 1; instance.ppEnabledExtensionNames = &extension; instance.pNext = &debug;
+    }
+    /* Explicit layer request fails if absent: validation runs cannot silently skip it. */
     VK_CALL(vkCreateInstance(&instance, NULL, &v->instance));
+    if (getenv("DHD_VK_VALIDATE")) {
+        PFN_vkCreateDebugUtilsMessengerEXT create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkCreateDebugUtilsMessengerEXT");
+        if (!create) abort();
+        VK_CALL(create(v->instance, &debug, NULL, &v->debug));
+        fprintf(stderr, "gs native Vulkan: Khronos validation enabled\n");
+    }
     uint32_t count = 0; VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, NULL));
     VkPhysicalDevice *devices = calloc(count, sizeof *devices); if (!devices) abort();
     VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, devices));
@@ -625,7 +647,12 @@ void native_vulkan_destroy(Native *n)
     for (unsigned j = 0; j < 2; j++) vkDestroyRenderPass(v->device, v->passes[j], NULL);
     vkDestroyDescriptorPool(v->device, v->descriptor_pool, NULL); vkDestroyPipelineLayout(v->device, v->layout, NULL);
     vkDestroyDescriptorSetLayout(v->device, v->descriptors, NULL); vkDestroyFence(v->device, v->fence, NULL);
-    vkDestroyCommandPool(v->device, v->pool, NULL); vkDestroyDevice(v->device, NULL); vkDestroyInstance(v->instance, NULL);
+    vkDestroyCommandPool(v->device, v->pool, NULL); vkDestroyDevice(v->device, NULL);
+    if (v->debug) {
+        PFN_vkDestroyDebugUtilsMessengerEXT destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkDestroyDebugUtilsMessengerEXT");
+        destroy(v->instance, v->debug, NULL);
+    }
+    vkDestroyInstance(v->instance, NULL);
     free(v); n->gpu = NULL; n->host->native = NULL;
     /* The frontend owns its frames/logs and its exit profile; retain it until process exit,
        matching the Windows frontend's lifetime, but no GPU/thread resources remain. */

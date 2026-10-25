@@ -64,10 +64,13 @@ def main():
     ap.add_argument('out', type=Path)
     ap.add_argument('captures', type=Path, nargs='+')
     ap.add_argument('--vulkan', action='store_true', help='build/run the Linux offscreen Vulkan backend')
+    ap.add_argument('--validation', action='store_true', help='require Khronos validation and synchronization checks (--vulkan)')
     ap.add_argument('--expect', type=Path, help='an earlier summary.txt the pictures must match')
     ap.add_argument('--tree', type=Path, default=ROOT, help='the checkout whose renderer is built (default: this one)')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE for the replay (DHD_* are otherwise cleared)')
     args = ap.parse_args()
+    if args.validation and not args.vulkan:
+        ap.error('--validation requires --vulkan')
     out = args.out.resolve()
     if ROOT / 'build' not in out.parents:
         ap.error('output must stay below build/')
@@ -75,6 +78,9 @@ def main():
     exe = build(out, args.tree.resolve(), args.vulkan)
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}
     env.update(item.split('=', 1) for item in args.env)
+    if args.validation:
+        env['VK_LAYER_VALIDATE_SYNC'] = '1'
+        env['DHD_VK_VALIDATE'] = '1'
     runner = ['wine', str(exe)] if LINUX and not args.vulkan else [str(exe)]
     if LINUX:
         env.setdefault('WINEDEBUG', '-all')
@@ -88,11 +94,13 @@ def main():
         lines += [line for line in run.stdout.splitlines() if line.startswith(('field ', 'readbacks '))]
         lines += [line for line in run.stderr.splitlines() if line.startswith('profile native:')]
         (prefix.with_suffix('.stderr.txt')).write_text(run.stderr)
+        (prefix.with_suffix('.stdout.txt')).write_text(run.stdout)
         if run.returncode:
             sys.stderr.write(run.stderr)
             return run.returncode
-        if args.vulkan and ('Validation Error' in run.stderr or 'VUID-' in run.stderr):
-            sys.stderr.write(run.stderr)
+        if args.vulkan and any(marker in run.stdout + run.stderr for marker in
+                               ('Validation Error', 'Validation Warning', 'VUID-', 'Vulkan validation:')):
+            sys.stderr.write(run.stdout + run.stderr)
             return 1
     summary = '\n'.join(lines) + '\n'
     (out / 'summary.txt').write_text(summary)
