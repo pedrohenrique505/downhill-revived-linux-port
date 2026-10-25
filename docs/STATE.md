@@ -1951,3 +1951,15 @@ five million VU0 native/reference cases and code guards pass. Default-build
 regression fails before/passes after; new window benchmark also goes red/green.
 Updated executable is in build/port/run/dhd. Real-time race and independent
 retail/D3D11 image parity remain open; matching sources/checks are unchanged.
+
+Linux exact GPU feeding (2026-10-25, finding 079, fork issue #1): DHD_BENCH/DHD_TIMELINE now
+work in the Linux presenter. Texture snapshots copy only dirty pages (45 full 4 MB copies per
+menu field before), dispatches take up to 4096 primitives and several register states
+(DHD_STATE_TABLE, Vulkan only, merged only for independent states with the same FRAME/ZBUF
+layout), local transfers and deferred reads run on the GPU as on D3D11, and commands are
+submitted as soon as the other bank is done. Menu 20.06 -> 40.35 fields/s, race ~20 -> 57.8.
+EE fiber stacks now sit below 0x10000000: the game masks a stack packet address with
+0x0FFFFFFF for sceGsExecLoadImage, which crashed the race navigation in about a third of runs.
+All captures keep byte-identical final VRAM; new fixtures aliased_states and
+deferred_read_waits go red without their rules. Menu is now limited by VU/GS CPU work; real
+time in the menu and independent retail/D3D11 parity remain open.
