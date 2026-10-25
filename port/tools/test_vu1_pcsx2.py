@@ -1,6 +1,7 @@
 """Compare VU1 with a pinned, independently compiled PCSX2 interpreter.
 
-Requires clang-cl/x86 libraries. Downloads public GPL reference sources into build/;
+Requires clang on Linux, or clang-cl/x86 libraries on Windows. Downloads
+public GPL reference sources into build/;
 retail microcode comes only from the user's DHD_VUTEXT (or assets/vutext.bin).
 Optional positional arguments are local DHD_VU_CAPTURE files. No game data is embedded.
 Mesh fixtures exercise setup and an unclipped three/four-vertex MSCNT packet.
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import urllib.request
 
 from vudis import walk
@@ -33,6 +35,39 @@ ENTRIES = (
 )
 
 
+def build_linux(aot, isa, thinlto, pgo_use):
+    flags = ['-m32', '-O2', '-m' + isa, '-mno-fma', '-mfpmath=sse',
+             '-ffp-contract=off', '-I' + str(ROOT / 'port/platform/linux/include'),
+             '-I' + str(OUT)]
+    if thinlto:
+        flags += ['-flto=thin', '-fuse-ld=lld']
+    reference = []
+    if aot:
+        subprocess.run(['clang', *flags, '-DPS2_VU_REFERENCE',
+                        '-Dps2_vu0_run=ps2_vu0_reference', '-Dps2_vu1_run=ps2_vu1_reference',
+                        '-Dps2_vu_aot_load=ps2_vu_aot_reference_load', '-c',
+                        str(ROOT / 'port/runtime/vu0_interp.c'), '-o', 'reference.o'], cwd=OUT, check=True)
+        reference = ['reference.o']
+        from vu1_aot import generate
+        print('VU1 AOT:', generate(OUT / 'vu1_aot.inc'), 'straight-line blocks', flush=True)
+        flags += ['-DPS2_VU_AOT', '-DPS2_VU_AOT_EMBED', '-DPS2_VU_AOT_TEST']
+    native_flags = ['-fprofile-instr-use=' + str(pgo_use.resolve()), '-Werror=profile-instr-out-of-date'] if pgo_use else []
+    if pgo_use and os.environ.get('DHD_VU_TRACE'):
+        raise ValueError('PGO oracle requires the normal, non-tracing runtime')
+    trace_flags = [] if pgo_use else ['-DPS2_VU_TRACE']
+    subprocess.run(['clang', *flags, *native_flags, *trace_flags, '-c',
+                    str(ROOT / 'port/runtime/vu0_interp.c'), '-o', 'native.o'], cwd=OUT, check=True)
+    subprocess.run(['clang++', *flags, '-std=c++20', '-c',
+                    str(ROOT / 'port/runtime/pcsx2_vu_oracle.cpp'), '-o', 'oracle.o'], cwd=OUT, check=True)
+    subprocess.run(['clang++', *flags, 'oracle.o', 'native.o', *reference, '-lm', '-o', 'oracle.exe'],
+                   cwd=OUT, check=True)
+    if aot:
+        subprocess.run(['clang', *flags, 'native.o',
+                        *[str(ROOT / p) for p in ('port/runtime/test_vu1.c', 'port/gs/memory.c', 'port/gs/gs.c')],
+                        '-lm', '-o', 'aot-instructions.exe'], cwd=OUT, check=True)
+        subprocess.run([str(OUT / 'aot-instructions.exe')], cwd=OUT, check=True)
+
+
 def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
     upstream = OUT / 'upstream'
     upstream.mkdir(parents=True, exist_ok=True)
@@ -51,6 +86,8 @@ def build(aot=False, isa="sse2", thinlto=False, pgo_use=None):
         if name == 'VU1microInterp.cpp':
             source = source[:source.index('InterpVU1 CpuIntVU1;')]
         (OUT / name).write_text(source, encoding='utf-8')
+    if sys.platform.startswith('linux'):
+        return build_linux(aot, isa, thinlto, pgo_use)
     flags = ['clang-cl', '-m32', '/nologo', '/O2', '-Wno-deprecated-declarations',
              '-m' + isa, '-mno-fma', '-mfpmath=sse', '/clang:-ffp-contract=off']
     if thinlto: flags += ['-flto=thin', '-fuse-ld=lld']

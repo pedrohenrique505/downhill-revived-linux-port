@@ -1936,3 +1936,18 @@ pass, with a failing corrupted-slot control. Windowed monitored menu sample:
 and copied to build/port/run/dhd. Real-time play and issue acceptance remain
 open; replay timings exclude EE/VU/game work. No independent retail/D3D11 parity
 or new image MATCH claimed; src/ and strict checks are unchanged.
+
+Linux VU/build and overlap continuation (2026-10-24, finding 078, fork issue #1):
+full-game profiling identifies VIF/VU CPU work as the menu bottleneck; CPU scanout
+is small and its proposed replacement is deferred. Ordinary Linux links now
+include the existing VU AOT/native paths by default, retaining explicit opt-out.
+Vulkan uses two fenced input/command banks to overlap preparation and execution,
+while host reads/uploads drain both. Real-menu paired checks improve 8.777 ->
+19.605 menu frames/fields/s; bounded race advances 61 ticks in 61 fields at
+20.024 fields/s. Isolated menu/race medians improve 31.895 -> 25.929 and
+42.319 -> 36.206 ms/field. All eleven GS replays retain full VRAM; GPU fixtures
+pass. Linux PCSX2 VU1 oracle: 1,584 seeded + 56 live cases, zero differences;
+five million VU0 native/reference cases and code guards pass. Default-build
+regression fails before/passes after; new window benchmark also goes red/green.
+Updated executable is in build/port/run/dhd. Real-time race and independent
+retail/D3D11 image parity remain open; matching sources/checks are unchanged.

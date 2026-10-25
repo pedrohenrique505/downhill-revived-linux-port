@@ -167,14 +167,17 @@ def runtime():
     """The inline asm runtime (port/runtime) and the native PS2 system (port/hle): host C, built
     against the platform's headers."""
     out = []
-    aot = os.environ.get('DHD_BUILD_VU_AOT') == '1'
+    # Linux's ordinary link is also the player build. Keep the acceleration
+    # used by build_clean.py; an explicit 0 still builds the diagnostic interpreter.
+    aot = os.environ.get('DHD_BUILD_VU_AOT', '1' if LINUX else '0') == '1'
     if aot:
         from vu1_aot import generate
         print('VU1 AOT: %d straight-line blocks' % generate(os.path.join(OUT, 'vu1_aot.inc')))
     if LINUX:
         from vulkan_shaders import generate
         generate(os.path.join(OUT, 'gs_spirv.h'))
-    shader = open(os.path.join(ROOT, 'port', 'gs', 'raster.hlsl'), encoding='utf-8').read()
+    with open(os.path.join(ROOT, 'port', 'gs', 'raster.hlsl'), encoding='utf-8') as f:
+        shader = f.read()
     with open(os.path.join(OUT, 'gs_shader.h'), 'w', encoding='utf-8') as f:
         f.write('static const char gs_shader[] = ' + json.dumps(shader) + ';\n')
         # A repo-relative name (shader error messages only), so no builder path ends up in dhd.exe.
