@@ -383,6 +383,24 @@ static void deferred_reads(void)
     CHECK(!memcmp(color, color_now, sizeof color) && color[0] == 0x21 && color[2] == 0x65);
 }
 
+/* Settling a deferred read waits for the GPU to reach it, with nothing else
+   synchronizing in between: the read follows a long run of queued draws. */
+static void deferred_read_waits(void)
+{
+    uint8_t color[64];
+    gs_write(&gs, GS_FRAME_1, 1u << 16);
+    gs_write(&gs, GS_ZBUF_1, UINT64_C(1) << 32);
+    gs_write(&gs, GS_TEST_1, 0);
+    gs_write(&gs, GS_SCISSOR_1, UINT64_C(63) << 16 | UINT64_C(63) << 48);
+    for (unsigned i = 0; i < 4000; i++) unsynced_sprite(0x80000000 | i, 0,0,64,64, 0);
+    memset(color, 0xCC, sizeof color);
+    start_read(0, 0, 3,5);
+    CHECK(gs_defer_read_image(&gs, color, sizeof color) == sizeof color);
+    gs_settle_reads(&gs);
+    CHECK(color[0] == (3999 & 255) && color[1] == 3999 >> 8 && color[2] == 0 && color[3] == 0x80);
+    CHECK(color[60] == (3999 & 255) && color[63] == 0x80);
+}
+
 int main(void)
 {
 #ifndef __linux__
@@ -551,6 +569,7 @@ int main(void)
 #endif
     local_copies();
     deferred_reads();
+    deferred_read_waits();
 #ifdef __linux__
     queued_states();
     aliased_states();

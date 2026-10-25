@@ -39,7 +39,7 @@ typedef struct {
     VkDescriptorSetLayout layout;
     VkDescriptorPool descriptors;
     VkDescriptorSet sets[INPUT_SLOTS];
-    VkDeviceSize strides[7];
+    VkDeviceSize strides[8];
     unsigned queued;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
@@ -47,8 +47,10 @@ typedef struct {
     VkPipelineLayout copy_pipeline_layout;
     VkPipeline copy_pipeline;
     VkDescriptorSet copy_sets[INPUT_SLOTS];
-    /* b0, u0, t0, t1, t2, t3 with explicit DXC binding shifts; local_copy's b2 */
-    Buffer buffers[7];
+    /* b0, u0, t0, t1, t2, t3 with explicit DXC binding shifts; local_copy's b2;
+       deferred-read staging */
+    Buffer buffers[8];
+    uint64_t submissions, bank_submission[SUBMISSIONS], staged_submission;
     Primitive pending[BATCH_DRAWS];
     Constants state, states[BATCH_STATES];
     unsigned state_count, state_new;
@@ -57,7 +59,6 @@ typedef struct {
     int dirty, texture_valid, batch_safe;
     uint64_t uploaded, state_version, texture_key, clamp_key, tex1_key, mip_key[2];
     uint32_t cpu_dirty[16], texture_dirty[16], texture_pages[16];
-    uint32_t *staged;
 } Gpu;
 static int check(VkResult result, const char *operation)
 {
@@ -140,6 +141,7 @@ static void submit(Gpu *p)
     VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &p->commands[p->bank]};
     require(vkQueueSubmit(p->queue, 1, &submit, p->fences[p->bank]), "submit compute");
     p->in_flight[p->bank] = 1;
+    p->bank_submission[p->bank] = ++p->submissions;
     p->queued = 0;
     p->bank = (p->bank+1) % SUBMISSIONS;
 }
@@ -239,22 +241,41 @@ static void sync_range(Gs *g, unsigned address, unsigned bytes)
         }
 }
 
+/* Deferred reads (gs.c): the dirty pages are copied on the GPU in order with
+   the draws, as D3D11 does, and only fetch_pages waits, for that submission. */
 static void stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[16])
 {
     Gpu *p = g->backend;
+    int any = 0;
+    for (unsigned i = 0; i < 16; i++) any |= (staged[i] = p->dirty ? want[i] & p->cpu_dirty[i] : 0) != 0;
+    if (!any) return;
     flush(p);
-    drain(p);
-    for (unsigned i = 0; i < 16; i++) staged[i] = want[i] & p->cpu_dirty[i];
-    for (unsigned page = 0; page < 512; page++)
-        if (staged[page/32] & (1u << (page&31)))
-            memcpy((uint8_t *)p->staged+page*8192, (uint8_t *)p->buffers[1].mapped+page*8192, 8192);
+    begin_commands(p);
+    VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    vkCmdPipelineBarrier(p->commands[p->bank], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+    VkBufferCopy copies[256];
+    unsigned runs = 0;
+    for (unsigned page = 0; page < 512; page++) {
+        if (!(staged[page/32] & (1u << (page&31)))) continue;
+        if (runs && copies[runs-1].srcOffset + copies[runs-1].size == page*8192u) copies[runs-1].size += 8192;
+        else copies[runs++] = (VkBufferCopy){.srcOffset = page*8192u, .dstOffset = page*8192u, .size = 8192};
+    }
+    vkCmdCopyBuffer(p->commands[p->bank], p->buffers[1].handle, p->buffers[7].handle, runs, copies);
+    p->queued++;
+    submit(p);
+    p->staged_submission = p->submissions;
 }
 static void fetch_pages(Gs *g, const uint32_t staged[16], uint32_t *image)
 {
     Gpu *p = g->backend;
+    for (unsigned bank = 0; bank < SUBMISSIONS; bank++)
+        if (p->bank_submission[bank] == p->staged_submission) retire(p, bank);
     for (unsigned page = 0; page < 512; page++)
         if (staged[page/32] & (1u << (page&31)))
-            memcpy((uint8_t *)image+page*8192, (uint8_t *)p->staged+page*8192, 8192);
+            memcpy((uint8_t *)image+page*8192, (uint8_t *)p->buffers[7].mapped+page*8192, 8192);
 }
 static void upload_pages(Gs *g)
 {
@@ -444,7 +465,7 @@ void gs_gpu_destroy(Gs *g)
             if (p->fences[bank]) vkDestroyFence(p->device, p->fences[bank], NULL);
             if (p->pools[bank]) vkDestroyCommandPool(p->device, p->pools[bank], NULL);
         }
-        for (unsigned i = 0; i < 7; i++) {
+        for (unsigned i = 0; i < 8; i++) {
             Buffer *b = &p->buffers[i];
             if (b->mapped) vkUnmapMemory(p->device, b->memory);
             if (b->handle) vkDestroyBuffer(p->device, b->handle, NULL);
@@ -453,7 +474,6 @@ void gs_gpu_destroy(Gs *g)
         vkDestroyDevice(p->device, NULL);
     }
     if (p->instance) vkDestroyInstance(p->instance, NULL);
-    free(p->staged);
     free(p);
     g->backend = NULL; g->draw = NULL; g->sync = NULL; g->sync_range = NULL; g->flush_draw = NULL; g->local_copy = NULL; g->stage_pages = NULL; g->fetch_pages = NULL;
 }
@@ -604,8 +624,7 @@ int gs_vulkan_init(Gs *g)
     result = vkCreateComputePipelines(p->device, VK_NULL_HANDLE, 1, &pipeline, NULL, &p->copy_pipeline);
     vkDestroyShaderModule(p->device, shader, NULL);
     if (!check(result, "create copy pipeline")) goto fail;
-    p->staged = malloc(GS_VRAM_SIZE);
-    if (!p->staged) goto fail;
+    if (!create_buffer(p, 7, GS_VRAM_SIZE)) goto fail;
     p->uploaded = p->state_version = UINT64_MAX;
     p->batch_limit = BATCH_DRAWS;
     const char *batch = getenv("DHD_GS_BATCH");
