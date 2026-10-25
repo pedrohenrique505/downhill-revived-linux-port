@@ -222,3 +222,411 @@ int native_gpu_surface(Native *n, NativeSurface *s, const unsigned want[2])
     if (old.image) { image_copy(v, &old, i, 0, 0, 0, 0, old.w, old.h); discard_image(v, &old); }
     s->size[0] = w; s->size[1] = h; return 1;
 }
+
+/* One immutable descriptor set per operation. All optional resources are valid zero images;
+   the shared shaders sometimes issue loads before selecting their result. */
+static const unsigned descriptor_bindings[] = {1,3,4,5,20,21,22,23,24,25,26,27,28,29,30,31,32,48,49,65,66};
+static VkDescriptorType descriptor_type(unsigned b)
+{
+    if (b < 16) return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    if (b == 22) return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (b >= 65) return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (b >= 48) return VK_DESCRIPTOR_TYPE_SAMPLER;
+    return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+}
+static VkDescriptorSet descriptors(NativeVk *v, unsigned constant_binding, const void *constants, size_t size,
+                                    Image *images[67], unsigned sampler)
+{
+    VkDeviceSize at = upload(v, constants, size);
+    VkDescriptorSet set;
+    VkDescriptorSetAllocateInfo a = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = v->descriptor_pool, .descriptorSetCount = 1, .pSetLayouts = &v->descriptors};
+    VK_CALL(vkAllocateDescriptorSets(v->device, &a, &set));
+    VkDescriptorImageInfo ii[21]; VkDescriptorBufferInfo bi[21]; VkWriteDescriptorSet writes[21];
+    for (unsigned j = 0; j < 21; j++) {
+        unsigned b = descriptor_bindings[j]; VkDescriptorType type = descriptor_type(b);
+        Image *image = images && images[b] ? images[b] : (b >= 29 && b <= 32 ? &v->dummy_depth : &v->dummy);
+        ii[j] = (VkDescriptorImageInfo){.imageView = image->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .sampler = v->samplers[b == 49 ? sampler : 0]};
+        bi[j] = b == 22 ? (VkDescriptorBufferInfo){v->inverse.buffer, 0, v->inverse.size} :
+            (VkDescriptorBufferInfo){v->arena.buffer, at, b == constant_binding ? size : 16};
+        writes[j] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = b, .descriptorCount = 1, .descriptorType = type,
+            .pImageInfo = &ii[j], .pBufferInfo = &bi[j]};
+    }
+    vkUpdateDescriptorSets(v->device, 21, writes, 0, NULL); return set;
+}
+static VkBlendFactor blend_factor(unsigned factor)
+{
+    switch (factor) {
+    case BLEND_ZERO: return VK_BLEND_FACTOR_ZERO;
+    case BLEND_ONE: return VK_BLEND_FACTOR_ONE;
+    case BLEND_SA: return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case BLEND_ISA: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    case BLEND_DA: return VK_BLEND_FACTOR_DST_ALPHA;
+    case BLEND_IDA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case BLEND_F: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case BLEND_IF: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    default: fprintf(stderr, "gs native Vulkan: unsupported blend factor %u\n", factor); exit(1);
+    }
+}
+static VkPipeline graphics_pipeline(NativeVk *v, unsigned kind, uint32_t blend, unsigned depth, unsigned mask)
+{
+    for (Pipeline *p = v->pipelines; p; p = p->next)
+        if (p->kind == kind && p->blend == blend && p->depth == depth && p->mask == mask) return p->pipeline;
+    Pipeline *p = calloc(1, sizeof *p); if (!p) abort();
+    p->kind = kind; p->blend = blend; p->depth = depth; p->mask = mask;
+    static const char *entries[] = {"native_vertex", "native_pixel", "native_scanout", "native_convert",
+        "present_vertex", "present_pixel", "native_blit", "native_upload_alpha"};
+    unsigned vs = kind ? 4 : 0, ps = kind == 1 ? 6 : kind == 2 ? 7 : 1;
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+            .module = v->shaders[vs], .pName = entries[vs]},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = v->shaders[ps], .pName = entries[ps]}};
+    VkVertexInputBindingDescription binding = {0, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attrs[] = {{0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(NativeVertex,x)},
+        {1,0,VK_FORMAT_R32G32B32A32_SFLOAT,offsetof(NativeVertex,s)}, {2,0,VK_FORMAT_R8G8B8A8_UINT,offsetof(NativeVertex,rgba)}};
+    VkPipelineVertexInputStateCreateInfo input = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = kind ? 0 : 1, .pVertexBindingDescriptions = &binding,
+        .vertexAttributeDescriptionCount = kind ? 0 : 3, .pVertexAttributeDescriptions = attrs};
+    VkPipelineInputAssemblyStateCreateInfo assembly = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo viewport = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo raster = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = VK_TRUE, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    static const VkCompareOp compare[] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
+    VkPipelineDepthStencilStateCreateInfo z = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = !!(depth & 8), .depthWriteEnable = !!(depth & 4), .depthCompareOp = compare[depth & 3]};
+    unsigned op = blend >> 11 & 7;
+    VkPipelineColorBlendAttachmentState attachment = {.blendEnable = blend & 1,
+        .srcColorBlendFactor = blend ? blend_factor(blend >> 1 & 31) : VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = blend ? blend_factor(blend >> 6 & 31) : VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = op == 2 ? VK_BLEND_OP_SUBTRACT : op == 3 ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = mask};
+    VkPipelineColorBlendStateCreateInfo color = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &attachment};
+    VkDynamicState states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dynamic = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3, .pDynamicStates = states};
+    VkGraphicsPipelineCreateInfo c = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = stages, .pVertexInputState = &input, .pInputAssemblyState = &assembly,
+        .pViewportState = &viewport, .pRasterizationState = &raster, .pMultisampleState = &ms,
+        .pDepthStencilState = &z, .pColorBlendState = &color, .pDynamicState = &dynamic,
+        .layout = v->layout, .renderPass = v->passes[!!(depth & 8)]};
+    VK_CALL(vkCreateGraphicsPipelines(v->device, VK_NULL_HANDLE, 1, &c, NULL, &p->pipeline));
+    p->next = v->pipelines; v->pipelines = p; return p->pipeline;
+}
+static void draw(NativeVk *v, Image *target, Image *depth, VkPipeline pipeline, VkDescriptorSet set,
+                 VkViewport viewport, VkRect2D rect, unsigned first, unsigned count, unsigned fix)
+{
+    if (!rect.extent.width || !rect.extent.height) return;
+    barrier(v);
+    VkImageView views[] = {target->view, depth ? depth->view : VK_NULL_HANDLE};
+    VkFramebuffer framebuffer;
+    VkFramebufferCreateInfo c = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = v->passes[depth != NULL], .attachmentCount = depth ? 2 : 1, .pAttachments = views,
+        .width = target->w, .height = target->h, .layers = 1};
+    VK_CALL(vkCreateFramebuffer(v->device, &c, NULL, &framebuffer));
+    Garbage *g = calloc(1, sizeof *g); if (!g) abort();
+    g->framebuffer = framebuffer; g->next = v->garbage; v->garbage = g;
+    VkRenderPassBeginInfo pass = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = c.renderPass,
+        .framebuffer = framebuffer, .renderArea = {{0,0},{target->w,target->h}}};
+    vkCmdBeginRenderPass(v->cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdSetViewport(v->cmd, 0, 1, &viewport); vkCmdSetScissor(v->cmd, 0, 1, &rect);
+    float f = fix/128.0f, factors[4] = {f,f,f,f}; vkCmdSetBlendConstants(v->cmd, factors);
+    vkCmdDraw(v->cmd, count, 1, first, 0); vkCmdEndRenderPass(v->cmd); barrier(v);
+}
+static void native_blit(NativeVk *v, Image *from, unsigned S, int sx, int sy, Image *to, unsigned T,
+                        int x, int y, int w, int h, Image *previous)
+{
+    if (x+w > (int)(to->w/T)) w = (int)(to->w/T)-x;
+    if (y+h > (int)(to->h/T)) h = (int)(to->h/T)-y;
+    if (w <= 0 || h <= 0) return;
+    float map[] = {(float)(previous ? x : sx-x), (float)(previous ? y : sy-y), (float)T, (float)S};
+    Image *images[67] = {[23] = from, [21] = previous};
+    VkDescriptorSet set = descriptors(v, 5, map, sizeof map, images, 0);
+    VkViewport viewport = {(float)(x*(int)T), (float)(y*(int)T), (float)(w*(int)T), (float)(h*(int)T), 0, 1};
+    VkRect2D rect = {{x*(int)T,y*(int)T},{w*T,h*T}};
+    draw(v, to, NULL, graphics_pipeline(v, previous ? 2 : 1, 0, 0, 15), set, viewport, rect, 0, 3, 0);
+}
+static Image *native_run_convert(Native *n, NativeFrame *f, unsigned index)
+{
+    NativeVk *v = n->gpu; NativeConvert *c = &f->converts[index];
+    NativeConvertConstants constants = c->constants; constants.tex[3] = 0;
+    Image *out = &v->converted[index];
+    if (out->w != constants.size[0] || out->h != constants.size[1]) {
+        discard_image(v, out); image_create(v, out, constants.size[0], constants.size[1], 0);
+    }
+    Image *images[67] = {[24] = texture_image(v, c->base), [66] = out};
+    for (unsigned j = 0; j < 4; j++) {
+        NativeSurface *s = c->surface[j] >= 0 ? &n->surfaces[c->surface[j]] : NULL;
+        if (s) images[25+j+(s->depth ? 4 : 0)] = &v->surfaces[c->surface[j]];
+        constants.tex[3] |= (s ? s->scale : 1) << (j*8);
+    }
+    VkDescriptorSet set = descriptors(v, 4, &constants, sizeof constants, images, 0);
+    barrier(v); vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->convert);
+    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(v->cmd, (out->w+7)/8, (out->h+7)/8, 1); barrier(v);
+    n->stats.conversions_run++; return out;
+}
+static int min_int(int a, int b) { return a < b ? a : b; }
+void native_gpu_draw(Native *n, NativeFrame *f, const NativeVertex *vertices)
+{
+    NativeVk *v = n->gpu; begin(v);
+    VkDeviceSize vertex_offset = 0;
+    if (f->vertex_count) vertex_offset = upload(v, vertices, (size_t)f->vertex_count*sizeof *vertices);
+    vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->arena.buffer, &vertex_offset);
+    int last_convert = -1; Image *converted = NULL;
+    for (unsigned j = 0; j < f->command_count; j++) {
+        const NativeCommand *k = &f->commands[j];
+        NativeSurface *s = &n->surfaces[k->target]; Image *target = &v->surfaces[k->target];
+        unsigned T = s->scale;
+        if (!target->image) continue;
+        if (k->kind != NATIVE_DRAW) last_convert = -1;
+        if (k->kind == NATIVE_IMPORT || k->kind == NATIVE_ALPHA_UPLOAD) {
+            if (k->kind == NATIVE_IMPORT && T == 1) image_upload(v, target, k->pixels, k->x, k->y, k->w, k->h);
+            else {
+                unsigned w = k->kind == NATIVE_ALPHA_UPLOAD ? 64 : k->w, h = k->kind == NATIVE_ALPHA_UPLOAD ? 32 : k->h;
+                Image page = {0}, previous = {0}; image_create(v, &page, w, h, 0);
+                image_upload(v, &page, k->pixels, 0, 0, w, h);
+                if (k->kind == NATIVE_ALPHA_UPLOAD) previous = snapshot(v, target);
+                native_blit(v, &page, 1, 0, 0, target, T, k->x, k->y, w, h, previous.image ? &previous : NULL);
+                discard_image(v, &previous); discard_image(v, &page);
+            }
+            continue;
+        }
+        if (k->kind == NATIVE_COPY) {
+            Image *from = &v->surfaces[k->source]; unsigned S = n->surfaces[k->source].scale;
+            int w = min_int(k->w, min_int((int)(from->w/S)-k->sx, (int)(target->w/T)-k->x));
+            int h = min_int(k->h, min_int((int)(from->h/S)-k->sy, (int)(target->h/T)-k->y));
+            if (!from->image || w <= 0 || h <= 0) continue;
+            Image copy = {0}; if (from == target) { copy = snapshot(v, from); from = &copy; }
+            if (S == T) image_copy(v, from, target, k->sx*S, k->sy*S, k->x*T, k->y*T, w*T, h*T);
+            else native_blit(v, from, S, k->sx, k->sy, target, T, k->x, k->y, w, h, NULL);
+            discard_image(v, &copy); continue;
+        }
+        if (!k->count) continue;
+        Image *depth = k->depth >= 0 && (k->depth_key & 8) ? &v->surfaces[k->depth] : NULL;
+        if (depth && (!depth->image || depth->w != target->w || depth->h != target->h)) depth = NULL;
+        Image *texture = &v->dummy, copy = {0}; unsigned S = 1;
+        if (k->texture_surface >= 0) {
+            texture = &v->surfaces[k->texture_surface]; S = n->surfaces[k->texture_surface].scale;
+            if (texture == target) { copy = snapshot(v, target); texture = &copy; }
+        } else if (k->texture) texture = texture_image(v, k->texture);
+        else if (k->convert >= 0) {
+            if (k->convert != last_convert) converted = native_run_convert(n, f, k->convert);
+            texture = converted; last_convert = k->convert;
+        }
+        if (k->convert < 0) last_convert = -1;
+        NativeConstants constants = k->constants; constants.scale = T | S << 8 | (S<T ? S:T) << 16;
+        Image *images[67] = {[20] = texture};
+        VkDescriptorSet set = descriptors(v, 3, &constants, sizeof constants, images, 0);
+        VkViewport viewport = {0,0,2048.0f*T,2048.0f*T,0,1};
+        int left = k->scissor.left*T, top = k->scissor.top*T;
+        int right = min_int(k->scissor.right*T, target->w), bottom = min_int(k->scissor.bottom*T, target->h);
+        if (left < 0) left = 0; if (top < 0) top = 0;
+        if (right > left && bottom > top) {
+            VkRect2D rect = {{left,top},{right-left,bottom-top}};
+            draw(v, target, depth, graphics_pipeline(v, 0, k->blend_key, depth ? k->depth_key : 0, k->color_mask),
+                set, viewport, rect, k->first, k->count, k->blend_fix);
+        }
+        discard_image(v, &copy);
+    }
+}
+static Image *display_size(Native *n, unsigned w, unsigned h)
+{
+    NativeVk *v = n->gpu;
+    if (v->display.w != w || v->display.h != h) {
+        discard_image(v, &v->display); image_create(v, &v->display, w, h, 0);
+    }
+    n->display_width = w; n->display_height = h; return &v->display;
+}
+int native_gpu_scanout(Native *n, NativeFrame *f)
+{
+    NativeVk *v = n->gpu;
+    if (f->display_surface < 0) { submit(v); return 0; }
+    unsigned scale = n->surfaces[f->display_surface].scale;
+    uint32_t d[12]; memcpy(d, f->display, sizeof d); d[5] *= scale; d[6] *= scale; d[8] = scale;
+    Image *out = display_size(n, d[5], d[6]);
+    Image *images[67] = {[21] = &v->surfaces[f->display_surface], [65] = out};
+    VkDescriptorSet set = descriptors(v, 1, d, sizeof d, images, 0);
+    barrier(v); vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->scanout);
+    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(v->cmd, (d[5]+7)/8, (d[6]+7)/8, 1); barrier(v); submit(v); return 1;
+}
+int native_gpu_movie(Native *n, NativeFrame *f)
+{
+    NativeVk *v = n->gpu; Image *out = display_size(n, f->movie_width, f->movie_height);
+    image_upload(v, out, f->movie, 0, 0, f->movie_width, f->movie_height); submit(v); return 1;
+}
+int native_gpu_read(Native *n, uint32_t *pixels)
+{
+    NativeVk *v = n->gpu; if (!v->display.image) return 0;
+    submit(v); retire(v);
+    size_t size = (size_t)n->display_width*n->display_height*4;
+    if (v->readback.size < size) { buffer_free(v, &v->readback); v->readback = buffer_create(v, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT); }
+    begin(v); barrier(v);
+    VkBufferImageCopy c = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+        .imageExtent = {n->display_width,n->display_height,1}};
+    vkCmdCopyImageToBuffer(v->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, v->readback.buffer, 1, &c);
+    VkMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    submit(v); retire(v); memcpy(pixels, v->readback.map, size); return 1;
+}
+unsigned native_gpu_window_height(Native *n) { (void)n; return 0; }
+int native_gpu_present(Native *n) { (void)n; return 0; } /* offscreen backend */
+void native_gpu_wait(Native *n) { (void)n; }
+int native_gpu_present_filter(Native *n, int point) { (void)n; (void)point; return 1; }
+void native_gpu_time(Native *n, int stage, const NativeFrame *f, float t, float cpu_ms)
+{ (void)n; (void)stage; (void)f; (void)t; (void)cpu_ms; }
+
+static int native_device_supported(VkPhysicalDevice physical, unsigned *family)
+{
+    VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(physical, &f);
+    VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(physical, &p);
+    VkPhysicalDeviceFloatControlsProperties floats = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &floats};
+    vkGetPhysicalDeviceProperties2(physical, &p2);
+    if (p.apiVersion < VK_API_VERSION_1_2 || !f.dualSrcBlend || !f.depthClamp ||
+        !floats.shaderSignedZeroInfNanPreserveFloat32 || p.limits.maxViewportDimensions[0] < 8192 ||
+        p.limits.maxViewportDimensions[1] < 8192 || p.limits.maxUniformBufferRange < sizeof(NativeConvertConstants)) return 0;
+    const VkFormat formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT};
+    for (unsigned j = 0; j < 2; j++) {
+        VkFormatProperties properties; vkGetPhysicalDeviceFormatProperties(physical, formats[j], &properties);
+        VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT | (j ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT :
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+        if ((properties.optimalTilingFeatures & needed) != needed) return 0;
+    }
+    uint32_t count = 0; vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, NULL);
+    VkQueueFamilyProperties *q = calloc(count, sizeof *q); if (!q) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, q);
+    int found = 0;
+    for (unsigned j = 0; j < count; j++) if ((q[j].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { *family = j; found = 1; break; }
+    free(q); return found;
+}
+int gs_vulkan_native(Gs *g)
+{
+    if (!g || !g->backend || !g->draw) return 0;
+    if (native_of(g)) return 1;
+    Native *n = native_create(); if (!n) return 0;
+    NativeVk *v = calloc(1, sizeof *v); if (!v) { free(n); return 0; } n->gpu = v;
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "Downhill Revived native GS", .apiVersion = VK_API_VERSION_1_2};
+    VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+    /* VK_INSTANCE_LAYERS can enable validation, including the offscreen test. */
+    VK_CALL(vkCreateInstance(&instance, NULL, &v->instance));
+    uint32_t count = 0; VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, NULL));
+    VkPhysicalDevice *devices = calloc(count, sizeof *devices); if (!devices) abort();
+    VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, devices));
+    unsigned family = 0;
+    for (unsigned j = 0; j < count; j++) if (native_device_supported(devices[j], &family)) { v->physical = devices[j]; break; }
+    free(devices);
+    if (!v->physical) {
+        fprintf(stderr, "gs native Vulkan: requires Vulkan 1.2 graphics/compute, dualSrcBlend, depthClamp, RGBA8 and sampled D32\n");
+        vkDestroyInstance(v->instance, NULL); free(v); free(n); return 0;
+    }
+    float priority = 1;
+    VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
+    VkPhysicalDeviceFeatures features = {.dualSrcBlend = VK_TRUE, .depthClamp = VK_TRUE};
+    VkDeviceCreateInfo device = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queue, .pEnabledFeatures = &features};
+    VK_CALL(vkCreateDevice(v->physical, &device, NULL, &v->device)); vkGetDeviceQueue(v->device, family, 0, &v->queue);
+    VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(v->physical, &properties);
+    v->alignment = properties.limits.minUniformBufferOffsetAlignment;
+    if (v->alignment < 16) v->alignment = 16;
+    VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
+    VK_CALL(vkCreateCommandPool(v->device, &pool, NULL, &v->pool));
+    VkCommandBufferAllocateInfo command = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = v->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VK_CALL(vkAllocateCommandBuffers(v->device, &command, &v->cmd));
+    VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VK_CALL(vkCreateFence(v->device, &fence, NULL, &v->fence));
+    VkDescriptorSetLayoutBinding bindings[21];
+    for (unsigned j = 0; j < 21; j++) bindings[j] = (VkDescriptorSetLayoutBinding){.binding = descriptor_bindings[j],
+        .descriptorType = descriptor_type(descriptor_bindings[j]), .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL};
+    VkDescriptorSetLayoutCreateInfo descriptor = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 21, .pBindings = bindings};
+    VK_CALL(vkCreateDescriptorSetLayout(v->device, &descriptor, NULL, &v->descriptors));
+    VkPipelineLayoutCreateInfo layout = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &v->descriptors};
+    VK_CALL(vkCreatePipelineLayout(v->device, &layout, NULL, &v->layout));
+    enum { SETS = 16384 };
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,4*SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,SETS},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,12*SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2*SETS}, {VK_DESCRIPTOR_TYPE_SAMPLER,2*SETS}};
+    VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = SETS, .poolSizeCount = 5, .pPoolSizes = sizes};
+    VK_CALL(vkCreateDescriptorPool(v->device, &dp, NULL, &v->descriptor_pool));
+    for (unsigned z = 0; z < 2; z++) {
+        VkAttachmentDescription attachments[2] = {
+            {.format = VK_FORMAT_R8G8B8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL},
+            {.format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL}};
+        VkAttachmentReference color = {0,VK_IMAGE_LAYOUT_GENERAL}, depth = {1,VK_IMAGE_LAYOUT_GENERAL};
+        VkSubpassDescription subpass = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1,
+            .pColorAttachments = &color, .pDepthStencilAttachment = z ? &depth : NULL};
+        VkRenderPassCreateInfo rp = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = z+1, .pAttachments = attachments, .subpassCount = 1, .pSubpasses = &subpass};
+        VK_CALL(vkCreateRenderPass(v->device, &rp, NULL, &v->passes[z]));
+    }
+#define SHADER(index, entry) do { VkShaderModuleCreateInfo m = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, \
+    .codeSize = sizeof gs_spirv_##entry, .pCode = gs_spirv_##entry}; \
+    VK_CALL(vkCreateShaderModule(v->device, &m, NULL, &v->shaders[index])); } while (0)
+    SHADER(0,native_vertex); SHADER(1,native_pixel); SHADER(2,native_scanout); SHADER(3,native_convert);
+    SHADER(4,present_vertex); SHADER(5,present_pixel); SHADER(6,native_blit); SHADER(7,native_upload_alpha);
+#undef SHADER
+    for (unsigned j = 0; j < 2; j++) {
+        VkComputePipelineCreateInfo c = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = v->shaders[2+j], .pName = j ? "native_convert" : "native_scanout"}, .layout = v->layout};
+        VK_CALL(vkCreateComputePipelines(v->device, VK_NULL_HANDLE, 1, &c, NULL, j ? &v->convert : &v->scanout));
+    }
+    for (unsigned j = 0; j < 8; j++) {
+        VkSamplerCreateInfo s = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = j & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .minFilter = VK_FILTER_LINEAR,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR, .addressModeU = j & 2 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeV = j & 4 ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE};
+        VK_CALL(vkCreateSampler(v->device, &s, NULL, &v->samplers[j]));
+    }
+    v->arena = buffer_create(v, 64u*1024*1024, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    v->inverse = buffer_create(v, 4096*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); native_page_inverse(v->inverse.map);
+    image_create(v, &v->dummy, 1, 1, 0); image_create(v, &v->dummy_depth, 1, 1, 1); submit(v);
+    native_present_options(n); native_start(g, n, (NativeHost *)g->backend);
+    fprintf(stderr, "gs: Vulkan native offscreen renderer: %s\n", properties.deviceName); return 1;
+}
+void native_vulkan_destroy(Native *n)
+{
+    NativeVk *v = n->gpu;
+    EnterCriticalSection(&n->queue_lock); n->quit = 1; WakeAllConditionVariable(&n->queue_changed); LeaveCriticalSection(&n->queue_lock);
+    if (n->thread) { WaitForSingleObject(n->thread, INFINITE); CloseHandle(n->thread); n->thread = NULL; }
+    submit(v); retire(v);
+    for (unsigned j = 0; j < NATIVE_TEXTURES; j++) native_gpu_texture_free(n, &n->textures[j]);
+    retire(v);
+    for (unsigned j = 0; j < NATIVE_SURFACES; j++) image_free(v, &v->surfaces[j]);
+    for (unsigned j = 0; j < NATIVE_CONVERTS; j++) image_free(v, &v->converted[j]);
+    image_free(v, &v->display); image_free(v, &v->dummy); image_free(v, &v->dummy_depth);
+    buffer_free(v, &v->arena); buffer_free(v, &v->inverse); buffer_free(v, &v->readback);
+    while (v->pipelines) { Pipeline *p = v->pipelines; v->pipelines = p->next; vkDestroyPipeline(v->device, p->pipeline, NULL); free(p); }
+    for (unsigned j = 0; j < 8; j++) { vkDestroyShaderModule(v->device, v->shaders[j], NULL); vkDestroySampler(v->device, v->samplers[j], NULL); }
+    vkDestroyPipeline(v->device, v->scanout, NULL); vkDestroyPipeline(v->device, v->convert, NULL);
+    for (unsigned j = 0; j < 2; j++) vkDestroyRenderPass(v->device, v->passes[j], NULL);
+    vkDestroyDescriptorPool(v->device, v->descriptor_pool, NULL); vkDestroyPipelineLayout(v->device, v->layout, NULL);
+    vkDestroyDescriptorSetLayout(v->device, v->descriptors, NULL); vkDestroyFence(v->device, v->fence, NULL);
+    vkDestroyCommandPool(v->device, v->pool, NULL); vkDestroyDevice(v->device, NULL); vkDestroyInstance(v->instance, NULL);
+    free(v); n->gpu = NULL; n->host->native = NULL;
+    /* The frontend owns its frames/logs and its exit profile; retain it until process exit,
+       matching the Windows frontend's lifetime, but no GPU/thread resources remain. */
+}

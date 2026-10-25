@@ -5,6 +5,7 @@
    dirty pages, preserving unrelated uploads and texture feedback snapshots.
    Native/upscaled rendering remains a separate backend. */
 #include "gpu.h"
+#include "native_gpu.h"
 #include "../../gs/gpu.h"
 #include <vulkan/vulkan.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@ enum { BATCH_DRAWS = 4096 };
 /* Register states one dispatch may hold (raster.hlsl, DHD_STATE_TABLE). */
 enum { BATCH_STATES = 256 };
 typedef struct {
+    NativeHost host;  /* must be first: portable frontend exact-probe hooks */
     VkInstance instance;
     VkPhysicalDevice physical;
     VkDevice device;
@@ -340,6 +342,10 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     miny = maximum(miny >> 4, (int)(scissor >> 32 & 2047));
     maxx = minimum((maxx + 15) >> 4, (int)(scissor >> 16 & 2047));
     maxy = minimum((maxy + 15) >> 4, (int)(scissor >> 48 & 2047));
+    if (gpu->host.clip_on) {
+        minx = maximum(minx, gpu->host.clip[0]); miny = maximum(miny, gpu->host.clip[1]);
+        maxx = minimum(maxx, gpu->host.clip[2]); maxy = minimum(maxy, gpu->host.clip[3]);
+    }
     if (minx > maxx || miny > maxy) return;
     if (gpu->state_version != g->state_version || gpu->state_context != ctxt) {
         /* Primitives of another state join the batch when no pixel of either
@@ -461,6 +467,9 @@ void gs_gpu_destroy(Gs *g)
 {
     Gpu *p = g->backend;
     if (!p) return;
+#ifdef DHD_NATIVE_VULKAN
+    if (p->host.native) native_vulkan_destroy(p->host.native);
+#endif
     if (p->device) {
         vkDeviceWaitIdle(p->device);
         if (p->pipeline) vkDestroyPipeline(p->device, p->pipeline, NULL);

@@ -2020,3 +2020,10 @@ Native Vulkan backend started (2026-10-25, finding 083, fork issue #15): scaled
 colour/depth surfaces and deferred native resources implemented in an offscreen
 backend. Pipeline/draw integration and image acceptance are in progress; no
 rendering or parity result claimed yet. Matching source/checks unchanged.
+Finding 083 continuation: the offscreen Vulkan graphics path now draws/scans out
+three recorded menu fields at 2x (1280x896) on i686 RADV, with uploads and two
+surface conversions. Replay support is `test_native_replay.py --vulkan`.
+Work paused per user instruction before adding tooling: this host lacks the
+32-bit Khronos validation layer required for issue #15 acceptance. Windows picture
+comparison, broader regressions and ordinary link integration remain pending;
+no parity/validation/issue completion claimed. Evidence stays in build/port/issue15/.
