@@ -21,7 +21,7 @@ def main():
     command = [clang, '--target=i686-pc-windows-msvc', '-O2', '-w',
                '-I', str(OUT), '-I', str(ROOT / 'port/gs')]
     command += [str(ROOT / 'port/gs' / name) for name in
-                ('test_native_transfers.c', 'gpu.c', 'gs.c', 'memory.c')]
+                ('test_native_transfers.c', 'gpu.c', 'native.c', 'gs.c', 'memory.c')]
     command += ['-o', str(exe), '-ld3d11', '-ldxgi', '-ld3dcompiler', '-luser32']
     subprocess.run(command, check=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith('DHD_')}

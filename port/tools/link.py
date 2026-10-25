@@ -29,8 +29,9 @@ LINUX = PLATFORM == 'linux'
 LINUX_FILES = {'runtime/memory.c': 'platform/linux/memory.c', 'runtime/fp_trap.c': 'platform/linux/fp_trap.c',
                'hle/host.c': 'platform/linux/host.c', 'gs/present.c': 'platform/linux/present.c', 'gs/gpu.c': 'platform/linux/gpu.c'}
 # Not on Linux yet: Direct3D 11 (the native renderer, texture packs, the sharp font) and WinHTTP
-# (online, the updater). platform/linux/not_yet.c has inert versions of what the rest calls.
-LINUX_LATER = { 'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
+# (online, the updater). platform/linux/not_yet.c has inert versions of what the rest calls. The
+# native renderer's frontend (gs/native.c) builds there, but has no backend to link with yet.
+LINUX_LATER = { 'gs/native.c', 'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
 LINUX_INCLUDE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'platform', 'linux', 'include')
 # The game's code keeps the stack only 4-aligned, as on Windows (pctarget.py): host functions it
 # calls realign theirs (-mstackrealign) before using 16-byte SSE spills.
@@ -184,7 +185,7 @@ def runtime():
         f.write('static const char gs_shader_path[] = ' + json.dumps('port/gs/raster.hlsl') + ';\n')
     for name in ('runtime/ps2asm.c', 'runtime/vu0_micro.c', 'runtime/vu0_interp.c', 'runtime/recomp.c', 'runtime/fp_trap.c', 'runtime/libc_shims.c',
                  'runtime/memory.c', 'hle/host.c', 'hle/autopad.c', 'hle/timer.c', 'hle/kernel.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
-                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/texpack.c', 'gs/font_sharp.c', 'gs/capture.c',
+                 'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/vif.c', 'hle/graphics.c', 'hle/graphics_queue.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/online_menu.c', 'hle/online.c', 'hle/puppet.c', 'hle/sound.c', 'gs/memory.c', 'gs/gs.c', 'gs/display.c', 'gs/present.c', 'gs/gpu.c', 'gs/native.c', 'gs/texpack.c', 'gs/font_sharp.c', 'gs/capture.c',
                  # the auto-updater (finding 054)
                  'hle/update.c', 'hle/game_options.c', 'hle/fps.c', 'hle/splash.c',
                  # the game's movies (finding 055)

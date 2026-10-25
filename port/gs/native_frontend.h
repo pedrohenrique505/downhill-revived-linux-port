@@ -12,9 +12,9 @@ typedef struct {
     unsigned abe, valid;
     NativeExactState state;
 } NativeExactCache;
-static const NativeExactState *native_exact_state(NativeExactCache *c,
-                                                 uint64_t zbuf, uint64_t test,
-                                                 uint64_t frame, unsigned abe)
+static inline const NativeExactState *native_exact_state(NativeExactCache *c,
+                                                        uint64_t zbuf, uint64_t test,
+                                                        uint64_t frame, unsigned abe)
 {
     if (c->valid && c->zbuf == zbuf && c->test == test && c->frame == frame && c->abe == abe)
         return &c->state;

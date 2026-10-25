@@ -147,8 +147,6 @@ static HRESULT shader_compile(const D3D_SHADER_MACRO *defines, const char *entry
 }
 
 static void flush(Gpu *gpu);
-static int native_capture(struct Native *n, uint32_t *pixels);
-static void native_profile(struct Native *n);
 #include "gpu_hw.inc"
 
 static uint64_t ticks(void) { LARGE_INTEGER n; QueryPerformanceCounter(&n); return (uint64_t)n.QuadPart; }
