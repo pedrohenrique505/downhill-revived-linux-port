@@ -146,6 +146,15 @@ static void submit(Gpu *p)
     p->bank = (p->bank+1) % SUBMISSIONS;
 }
 
+/* After recording a command: submit at capacity, or at once when the other
+   bank is done, so the GPU isn't left idle while more commands accumulate. */
+static void queued(Gpu *p)
+{
+    unsigned other = (p->bank+1) % SUBMISSIONS;
+    if (++p->queued == DISPATCH_SLOTS || !p->in_flight[other] ||
+        vkGetFenceStatus(p->device, p->fences[other]) == VK_SUCCESS) submit(p);
+}
+
 static void drain(Gpu *p)
 {
     submit(p);
@@ -202,7 +211,7 @@ static void flush(Gpu *p)
     vkCmdBindPipeline(p->commands[p->bank], VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
     vkCmdBindDescriptorSets(p->commands[p->bank], VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline_layout, 0, 1, &p->sets[slot], 0, NULL);
     vkCmdDispatch(p->commands[p->bank], width, height, 1);
-    if (++p->queued == DISPATCH_SLOTS) submit(p);
+    queued(p);
     p->pending_count = p->memberships = p->state_count = 0;
 }
 static void flush_draw(Gs *g) { flush(g->backend); }
@@ -381,7 +390,7 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
                 else copies[runs++] = (VkBufferCopy){.srcOffset = page*8192u, .dstOffset = page*8192u, .size = 8192};
             }
             vkCmdCopyBuffer(gpu->commands[gpu->bank], gpu->buffers[1].handle, gpu->buffers[2].handle, runs, copies);
-            if (++gpu->queued == DISPATCH_SLOTS) submit(gpu);
+            queued(gpu);
             memset(gpu->texture_dirty, 0, sizeof gpu->texture_dirty);
             break;
         }
@@ -442,7 +451,7 @@ static int local_copy(Gs *g)
     vkCmdBindPipeline(gpu->commands[gpu->bank], VK_PIPELINE_BIND_POINT_COMPUTE, gpu->copy_pipeline);
     vkCmdBindDescriptorSets(gpu->commands[gpu->bank], VK_PIPELINE_BIND_POINT_COMPUTE, gpu->copy_pipeline_layout, 0, 1, &gpu->copy_sets[slot], 0, NULL);
     vkCmdDispatch(gpu->commands[gpu->bank], (width + 7) / 8, (height + 7) / 8, 1);
-    if (++gpu->queued == DISPATCH_SLOTS) submit(gpu);
+    queued(gpu);
     for (unsigned i = 0; i < 16; i++) { gpu->cpu_dirty[i] |= to[i]; gpu->texture_dirty[i] |= to[i]; }
     gpu->dirty = 1;
     return 1;
