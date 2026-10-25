@@ -1910,3 +1910,17 @@ the D3D11 raster backend and installs no replacement (fork issue #12). About 59 
 rasterization is not rendering performance. SIGINT exits promptly; close-button automation,
 keyboard/controller play and retail picture comparisons remain unverified or blocked. The
 presenter comment now describes this limitation accurately. No raster backend fix is claimed.
+
+Linux exact raster backend (2026-10-24, finding 076, fork issue #1): Vulkan compute
+now installs drawing/synchronization callbacks before game startup, compiles the
+shared HLSL to embedded SPIR-V with DXC, and presents through SDL Vulkan. Shared
+raster fixtures and GS storage tests pass on i686 RADV; real loading/rider/menu
+captures contain the game. Integer line-end coverage fixes an observed Vulkan
+rounding difference without weakening its test. Disjoint SDL event consumers
+preserve close/text events. This host needed lib32-vulkan-radeon. Windowed race
+rendering, user-confirmed keyboard/Xbox play, three compositor closes and SIGINT
+pass. Active rendering is about 8.17 menu frames/s in a monitored interval;
+race sample: 11.50 fields/buffer changes/clock ticks per second. PCSX2 software
+GS replays give RGB MAE 0.3685 (menu) and 0.3808 (race), with two race pixels
+exceeding 16. D3D11/independent retail parity and those outliers remain open;
+issue #1 is not fully accepted. No game data/captures committed, matching source unchanged.

@@ -233,3 +233,41 @@ tools set `DHD_SETTINGS=none`) none of them apply. Tools that drive the game (`D
 `port/include/version.h` holds the version, the only place it is written. `package_release.py`
 names the zip after it and writes `build/release/latest.json` beside it (version, the release
 asset URL, the zip's SHA-256 and size) for the updater; publish both as release assets.
+
+## Linux exact renderer (i686)
+
+The Linux port uses Vulkan 1.2 compute for `DHD_RENDER=exact`, with the shared
+`port/gs/raster.hlsl` shader and SDL3 Vulkan presentation. The device must support
+`shaderFloat64` and `shaderSignedZeroInfNanPreserveFloat32`. The native/upscaled
+D3D11 backend, texture packs and updater have not been ported to Linux.
+
+In addition to the extracted executable/build prerequisites, install clang/lld,
+LLVM tools, a 32-bit C development environment, Vulkan headers and **both the
+32-bit Vulkan loader and your GPU's 32-bit Vulkan driver**. A working 64-bit
+Vulkan application alone does not establish i686 driver support. On Arch/AMD,
+the driver package is `lib32-vulkan-radeon` (with `lib32-vulkan-icd-loader`).
+
+Download the official Linux [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler/releases),
+extract it, and put `dxc` on PATH or set `DXC` to its executable. Shaders compile
+to SPIR-V at build time and are embedded in the host executable; no shader
+compiler is required at game startup. SDL3 is built by the existing build tools.
+
+```sh
+python port/tools/build.py
+DXC=/path/to/dxc python port/tools/link.py
+DHD_ISO='/path/to/your/Downhill Domination (USA).iso' \
+  DHD_RENDER=exact DHD_SKIP_MOVIES=1 ./build/port/link/dhd
+```
+
+Run the applicable GS memory and shared raster fixtures with:
+
+```sh
+DXC=/path/to/dxc python port/tools/test_vulkan.py
+```
+
+The initial backend completes ordered batches with fences, snapshots texture
+memory before feedback sampling, and merges CPU/GPU writes by GS page. Local
+copies use the existing ordered CPU transfer path. Scanout/readbacks synchronize
+VRAM before SDL uploads the display picture. These choices prioritize correctness;
+Vulkan support alone does not imply real-time performance. See finding 076 for
+validation results and outstanding acceptance work.

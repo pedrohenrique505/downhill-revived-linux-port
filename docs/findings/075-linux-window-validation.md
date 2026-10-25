@@ -5,6 +5,9 @@ Spec: [fork issue #1](https://github.com/pedrohenrique505/downhill-revived/issue
 “Linux: check the exact renderer with a window (picture, speed, input, closing)”.
 Confirmed failure: [#12](https://github.com/pedrohenrique505/downhill-revived/issues/12).
 
+Implementation continuation: [finding 076](076-linux-vulkan-exact.md). The
+results below describe the original missing-backend build.
+
 ## Results
 
 SDL3 created a Wayland window with its OpenGL renderer on this host. The attached Xbox 360
