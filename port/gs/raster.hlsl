@@ -9,6 +9,9 @@
 #ifndef DHD_ADDRESS_SHIFT
 #define DHD_ADDRESS_SHIFT 0
 #endif
+#ifndef DHD_STATE_TABLE
+#define DHD_STATE_TABLE 0
+#endif
 
 cbuffer State : register(b0) {
     uint4 regs[128];
@@ -35,6 +38,27 @@ struct Primitive {
 };
 StructuredBuffer<Primitive> primitives : register(t1);
 StructuredBuffer<uint> tile_list : register(t2);
+#if DHD_STATE_TABLE
+// Primitives of several register states share a dispatch (Vulkan): each one's
+// info.w picks its state, laid out as the State cbuffer; that cbuffer then
+// holds only the dispatch's bounds and info.x.
+struct DrawState {
+    uint4 regs[128];
+    uint4 position[3];
+    uint4 uv[3];
+    float4 stq[3];
+    uint4 bounds;
+    uint4 info;
+    uint4 palette[64];
+};
+StructuredBuffer<DrawState> states : register(t3);
+static uint draw_state;
+#define regs (states[draw_state].regs)
+#define palette (states[draw_state].palette)
+#define independent_pixels ((states[draw_state].info.y & 1) != 0)
+#else
+#define independent_pixels ((info.y & 1) != 0)
+#endif
 cbuffer Display : register(b1) { uint4 display_state[3]; };
 cbuffer Copy : register(b2) { uint4 copy_state[3]; };
 RWTexture2D<float4> screen : register(u1);
@@ -129,7 +153,7 @@ void write_pixel(uint psm, uint bp, uint bw, uint2 xy, uint value, uint preserve
 }
 
 void write_raster_pixel(uint psm, uint bp, uint bw, uint2 xy, uint value, uint preserve) {
-    write_pixel_impl(psm, bp, bw, xy, value, preserve, (info.y & 1) != 0);
+    write_pixel_impl(psm, bp, bw, xy, value, preserve, independent_pixels);
 }
 
 int4 rgba(uint v) { return int4(v & 255, v >> 8 & 255, v >> 16 & 255, v >> 24); }
@@ -295,7 +319,7 @@ void draw_pixel(uint2 xy, Primitive d) {
     // info.y bit 0 is the host's independent_pixels proof for this dispatch.
     // Unsafe aliases retain the original late load: another pixel may write Z
     // while this invocation shades. Texture reads use a separate snapshot SRV.
-    bool early_depth = (info.y & 1) != 0;
+    bool early_depth = independent_pixels;
     if (early_depth) {
         uint early_test = regs[71 + ctxt].x;
         if (early_test & 0x10000) {
@@ -397,7 +421,13 @@ void main(uint3 tid : SV_DispatchThreadID, uint3 group : SV_GroupID) {
     uint2 xy = bounds.xy + tid.xy;
     uint tile = (group.y * info.x + group.x) * 2;
     uint first = tile_list[tile], count = tile_list[tile + 1];
-    [loop] for (uint i = 0; i < count; i++) draw_pixel(xy, primitives[tile_list[first + i]]);
+    [loop] for (uint i = 0; i < count; i++) {
+        Primitive d = primitives[tile_list[first + i]];
+#if DHD_STATE_TABLE
+        draw_state = d.info.w;
+#endif
+        draw_pixel(xy, d);
+    }
 }
 
 // A local-to-local transfer (TRXDIR 2) between rectangles on different pages: each pixel is

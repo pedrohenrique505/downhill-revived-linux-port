@@ -188,6 +188,36 @@ static void queued_states(void)
     for (unsigned i = 0; i < 48; i++)
         CHECK(at(i,0) == ((i & 1 ? 0x00112200 : 0x80112200) | i));
 }
+
+/* Two states that each pass the independence proof may share a dispatch only
+   when they draw into the same layout. Pixel (0,32) at FBW 1 and pixel (64,0)
+   at FBW 2 are the same word: the blend must see the end of the long chain
+   of points before it, though they lie in different tiles. */
+static void aliased_states(void)
+{
+    gs_gpu_destroy(&gs); gs_reset(&gs);
+    CHECK(init_backend());
+    gs_write(&gs, GS_ZBUF_1, UINT64_C(1) << 32);
+    gs_write(&gs, GS_COLCLAMP, 1);
+    gs_write(&gs, GS_FRAME_1, 1u << 16);
+    gs_write(&gs, GS_SCISSOR_1, UINT64_C(63) << 16 | UINT64_C(63) << 48);
+    gs_write(&gs, GS_PRIM, 0);
+    for (unsigned i = 0; i < 1000; i++) {
+        gs_write(&gs, GS_RGBAQ, 0x80000000 | i);
+        vertex(0, 32, 1);
+    }
+    gs_write(&gs, GS_FRAME_1, 2u << 16);
+    gs_write(&gs, GS_SCISSOR_1, UINT64_C(127) << 16 | UINT64_C(63) << 48);
+    gs_write(&gs, GS_ALPHA_1, 1u << 2 | 1u << 6);  /* (Cs - Cd) * As / 128 + Cd */
+    gs_write(&gs, GS_PRIM, 64);
+    gs_write(&gs, GS_RGBAQ, 0x40C0C0C0);
+    vertex(64, 0, 1);
+    gs.sync(&gs);
+    /* Cd is the 1000th point, 0x800003E7: red (C0-E7)*40/80 = -20 -> D3, green
+       5E + 03, blue 60; the source alpha is written. */
+    CHECK(gs_read_pixel(&gs, 0, 0, 2, 64, 0) == 0x406061D3);
+    gs_write(&gs, GS_ALPHA_1, 0);
+}
 #endif
 
 static void batch_ordering(void)
@@ -527,6 +557,7 @@ int main(void)
     deferred_reads();
 #ifdef __linux__
     queued_states();
+    aliased_states();
 #endif
     gs_gpu_destroy(&gs);
 #ifndef __linux__

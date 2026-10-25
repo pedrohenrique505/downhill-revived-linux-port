@@ -25,6 +25,8 @@ enum { DISPATCH_SLOTS = 16, SUBMISSIONS = 2, INPUT_SLOTS = DISPATCH_SLOTS * SUBM
    workgroup while the others sit idle: fewer, larger batches shorten that
    chain. D3D11's MAX_DRAWS stays as it is. */
 enum { BATCH_DRAWS = 4096 };
+/* Register states one dispatch may hold (raster.hlsl, DHD_STATE_TABLE). */
+enum { BATCH_STATES = 256 };
 typedef struct {
     VkInstance instance;
     VkPhysicalDevice physical;
@@ -37,13 +39,15 @@ typedef struct {
     VkDescriptorSetLayout layout;
     VkDescriptorPool descriptors;
     VkDescriptorSet sets[INPUT_SLOTS];
-    VkDeviceSize strides[5];
+    VkDeviceSize strides[6];
     unsigned queued;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
-    Buffer buffers[5]; /* b0, u0, t0, t1, t2, with explicit DXC binding shifts */
+    Buffer buffers[6]; /* b0, u0, t0, t1, t2, t3, with explicit DXC binding shifts */
     Primitive pending[BATCH_DRAWS];
-    Constants state;
+    Constants state, states[BATCH_STATES];
+    unsigned state_count, state_new;
+    uint32_t surface[2];
     unsigned pending_count, memberships, batch_limit, state_context;
     int dirty, texture_valid, batch_safe;
     uint64_t uploaded, state_version, texture_key, clamp_key, tex1_key, mip_key[2];
@@ -181,6 +185,7 @@ static void flush(Gpu *p)
     p->state.info[0] = width; p->state.info[1] = p->batch_safe ? 1 : 0;
     memcpy((uint8_t *)p->buffers[0].mapped + slot*p->strides[0], &p->state, sizeof p->state);
     memcpy((uint8_t *)p->buffers[3].mapped + slot*p->strides[3], p->pending, p->pending_count*sizeof(Primitive));
+    memcpy((uint8_t *)p->buffers[5].mapped + slot*p->strides[5], p->states, p->state_count*sizeof(Constants));
     begin_commands(p);
     VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -191,7 +196,7 @@ static void flush(Gpu *p)
     vkCmdBindDescriptorSets(p->commands[p->bank], VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline_layout, 0, 1, &p->sets[slot], 0, NULL);
     vkCmdDispatch(p->commands[p->bank], width, height, 1);
     if (++p->queued == DISPATCH_SLOTS) submit(p);
-    p->pending_count = p->memberships = 0;
+    p->pending_count = p->memberships = p->state_count = 0;
 }
 static void flush_draw(Gs *g) { flush(g->backend); }
 
@@ -302,7 +307,16 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     maxy = minimum((maxy + 15) >> 4, (int)(scissor >> 48 & 2047));
     if (minx > maxx || miny > maxy) return;
     if (gpu->state_version != g->state_version || gpu->state_context != ctxt) {
-        flush(gpu);
+        /* Primitives of another state join the batch when no pixel of either
+           can reach another's memory: both pass the independence proof and
+           draw into the same frame and Z layout, so each coordinate keeps its
+           own words and the tile lists keep each pixel's order. */
+        uint64_t zbuf = g->reg[GS_ZBUF_1 + ctxt], test = g->reg[GS_TEST_1 + ctxt];
+        int z_used = !((zbuf >> 32 & 1) && (!(test >> 16 & 1) || (test >> 17 & 3) <= 1));
+        uint32_t surface[2] = {(uint32_t)g->reg[GS_FRAME_1 + ctxt], (uint32_t)zbuf | (uint32_t)z_used << 31};
+        int safe = gs_raster_independent_pixels(g, ctxt);
+        if (!safe || gpu->state_count == BATCH_STATES || memcmp(surface, gpu->surface, sizeof surface)) flush(gpu);
+        memcpy(gpu->surface, surface, sizeof surface);
         static const unsigned registers[] = {6,7,8,9,20,21,34,52,53,54,55,59,61,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79};
         for (unsigned r = 0; r < sizeof registers / sizeof *registers; r++) {
             unsigned i = registers[r];
@@ -310,7 +324,8 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
         }
         for (unsigned i = 0; i < 256; i++) gpu->state.palette[i] = gs_palette(g, g->reg[GS_TEX0_1 + ctxt], i);
         gpu->state_version = g->state_version; gpu->state_context = ctxt;
-        gpu->batch_safe = gs_raster_independent_pixels(g, ctxt);
+        gpu->batch_safe = safe;
+        gpu->state_new = 1;
     }
     c.bounds[0] = (uint32_t)minx; c.bounds[1] = (uint32_t)miny;
     c.bounds[2] = (uint32_t)(maxx - minx + 1); c.bounds[3] = (uint32_t)(maxy - miny + 1);
@@ -345,11 +360,17 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
             break;
         }
     }
+    if (gpu->state_new || !gpu->state_count) {
+        gpu->state.info[1] = gpu->batch_safe ? 1 : 0;
+        gpu->states[gpu->state_count++] = gpu->state;
+        gpu->state_new = 0;
+    }
     Primitive *p = &gpu->pending[gpu->pending_count++];
     memcpy(p->position, c.position, sizeof p->position); memcpy(p->uv, c.uv, sizeof p->uv);
     memcpy(p->stq, c.stq, sizeof p->stq); memcpy(p->info, c.info, sizeof p->info);
     memcpy(p->bounds, c.bounds, sizeof p->bounds);
     memcpy(p->depth, c.depth, sizeof p->depth);
+    p->info[3] = gpu->state_count - 1;
     gpu->memberships += memberships;
     gpu->dirty = 1;
     uint32_t written[16] = {0};
@@ -377,7 +398,7 @@ void gs_gpu_destroy(Gs *g)
             if (p->fences[bank]) vkDestroyFence(p->device, p->fences[bank], NULL);
             if (p->pools[bank]) vkDestroyCommandPool(p->device, p->pools[bank], NULL);
         }
-        for (unsigned i = 0; i < 5; i++) {
+        for (unsigned i = 0; i < 6; i++) {
             Buffer *b = &p->buffers[i];
             if (b->mapped) vkUnmapMemory(p->device, b->memory);
             if (b->handle) vkDestroyBuffer(p->device, b->handle, NULL);
@@ -460,13 +481,14 @@ int gs_vulkan_init(Gs *g)
         VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (!check(vkCreateFence(p->device, &fence, NULL, &p->fences[bank]), "create fence")) goto fail;
     }
-    const VkDeviceSize sizes[] = {sizeof(Constants), GS_VRAM_SIZE, GS_VRAM_SIZE, BATCH_DRAWS*sizeof(Primitive), MAX_BIN_WORDS*4};
-    VkDescriptorSetLayoutBinding bindings[5] = {0};
-    VkDescriptorBufferInfo buffers[5] = {0};
-    for (unsigned i = 0; i < 5; i++) {
+    const VkDeviceSize sizes[] = {sizeof(Constants), GS_VRAM_SIZE, GS_VRAM_SIZE, BATCH_DRAWS*sizeof(Primitive), MAX_BIN_WORDS*4,
+                                  BATCH_STATES*sizeof(Constants)};
+    VkDescriptorSetLayoutBinding bindings[6] = {0};
+    VkDescriptorBufferInfo buffers[6] = {0};
+    for (unsigned i = 0; i < 6; i++) {
         VkDeviceSize alignment = i ? properties.limits.minStorageBufferOffsetAlignment : properties.limits.minUniformBufferOffsetAlignment;
         p->strides[i] = (sizes[i]+alignment-1)/alignment*alignment;
-        unsigned slots = (i == 0 || i == 3 || i == 4) ? INPUT_SLOTS : 1;
+        unsigned slots = (i == 0 || i >= 3) ? INPUT_SLOTS : 1;
         if (!create_buffer(p, i, p->strides[i]*slots)) goto fail;
         bindings[i] = (VkDescriptorSetLayoutBinding){.binding = i,
             .descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -474,9 +496,9 @@ int gs_vulkan_init(Gs *g)
         buffers[i] = (VkDescriptorBufferInfo){.buffer = p->buffers[i].handle, .range = sizes[i]};
     }
     VkDescriptorSetLayoutCreateInfo layout = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 5, .pBindings = bindings};
+        .bindingCount = 6, .pBindings = bindings};
     if (!check(vkCreateDescriptorSetLayout(p->device, &layout, NULL, &p->layout), "create descriptors")) goto fail;
-    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, INPUT_SLOTS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4*INPUT_SLOTS}};
+    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, INPUT_SLOTS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5*INPUT_SLOTS}};
     VkDescriptorPoolCreateInfo descriptors = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = INPUT_SLOTS, .poolSizeCount = 2, .pPoolSizes = pool_sizes};
     if (!check(vkCreateDescriptorPool(p->device, &descriptors, NULL, &p->descriptors), "create descriptor pool")) goto fail;
@@ -484,14 +506,14 @@ int gs_vulkan_init(Gs *g)
         VkDescriptorSetAllocateInfo set = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = p->descriptors, .descriptorSetCount = 1, .pSetLayouts = &p->layout};
         if (!check(vkAllocateDescriptorSets(p->device, &set, &p->sets[slot]), "allocate descriptors")) goto fail;
-        VkWriteDescriptorSet writes[5] = {0};
-        for (unsigned i = 0; i < 5; i++) {
-            buffers[i].offset = (i == 0 || i == 3 || i == 4) ? slot*p->strides[i] : 0;
+        VkWriteDescriptorSet writes[6] = {0};
+        for (unsigned i = 0; i < 6; i++) {
+            buffers[i].offset = (i == 0 || i >= 3) ? slot*p->strides[i] : 0;
             writes[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = p->sets[slot], .dstBinding = i, .descriptorCount = 1, .descriptorType = bindings[i].descriptorType,
                 .pBufferInfo = &buffers[i]};
         }
-        vkUpdateDescriptorSets(p->device, 5, writes, 0, NULL);
+        vkUpdateDescriptorSets(p->device, 6, writes, 0, NULL);
     }
     VkPipelineLayoutCreateInfo pipeline_layout = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &p->layout};

@@ -16,7 +16,7 @@ def generate(output):
         raise RuntimeError('Linux exact renderer requires DXC; set DXC to the official dxc executable')
     binary = output.with_suffix('.spv')
     subprocess.run([compiler, '-spirv', '-T', 'cs_6_0', '-E', 'main',
-                    '-Gis', '-D', 'DHD_EARLY_DEPTH=1', '-D', 'DHD_EXCLUSIVE_WORD_STORE=1',
+                    '-Gis', '-D', 'DHD_EARLY_DEPTH=1', '-D', 'DHD_EXCLUSIVE_WORD_STORE=1', '-D', 'DHD_STATE_TABLE=1',
                     '-fspv-target-env=vulkan1.2', '-fvk-use-dx-layout',
                     '-fvk-u-shift', '1', '0', '-fvk-t-shift', '2', '0',
                     '-Fo', str(binary), str(source)], check=True)
