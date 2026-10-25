@@ -12,6 +12,7 @@
 
 #include "raster_types.h"
 #include "raster_math.h"
+#include "native.h"
 
 enum { TRACE_RING = 32, TRACE_DISPATCHES = 2048 };
 typedef struct {
@@ -23,6 +24,8 @@ typedef struct {
     double wall_end;
 } GpuTraceFrame;
 typedef struct {
+    /* DHD_RENDER=native (gpu_native.inc): this backend then only answers the Z probe. */
+    NativeHost host;
     ID3D11Device *device;
     ID3D11DeviceContext *context;
     ID3D11Buffer *vram, *snapshot, *readback, *constants, *staged;
@@ -63,10 +66,6 @@ typedef struct {
     ID3D11Texture2D *display, *display_readback;
     ID3D11UnorderedAccessView *display_uav;
     unsigned display_width, display_height;
-    /* DHD_RENDER=native (gpu_native.inc): this backend then only answers the Z probe, and
-       clips every primitive to clip (inclusive pixels). */
-    struct Native *native;
-    int clip_on, clip[4];
 } Gpu;
 
 /* raster.hlsl's shaders, compiled once and kept: D3DCompile takes seconds for each of them, at
@@ -276,7 +275,7 @@ void gs_gpu_profile(Gs *g, double seconds)
     fprintf(stderr, "profile GS: %.1f draws/s, %.1f snapshots/s, %.1f uploads/s, draw %.1f ms/s, readback %.1f ms/s, %.1f dispatches/s, %.1f local copies/s\n",
             gpu->draws / seconds, gpu->snapshots / seconds, gpu->uploads / seconds,
             gpu->draw_ticks * ms, gpu->sync_ticks * ms, gpu->dispatches / seconds, gpu->copies / seconds);
-    if (gpu->native) native_profile(gpu->native);
+    if (gpu->host.native) native_profile(gpu->host.native);
     gpu->draw_ticks = gpu->sync_ticks = gpu->draws = gpu->snapshots = gpu->uploads = 0;
     gpu->dispatches = gpu->copies = 0;
 }
@@ -643,9 +642,9 @@ static void draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
     miny = maximum(miny >> 4, (int)(scissor >> 32 & 2047));
     maxx = minimum((maxx + 15) >> 4, (int)(scissor >> 16 & 2047));
     maxy = minimum((maxy + 15) >> 4, (int)(scissor >> 48 & 2047));
-    if (gpu->clip_on) {
-        minx = maximum(minx, gpu->clip[0]); miny = maximum(miny, gpu->clip[1]);
-        maxx = minimum(maxx, gpu->clip[2]); maxy = minimum(maxy, gpu->clip[3]);
+    if (gpu->host.clip_on) {
+        minx = maximum(minx, gpu->host.clip[0]); miny = maximum(miny, gpu->host.clip[1]);
+        maxx = minimum(maxx, gpu->host.clip[2]); maxy = minimum(maxy, gpu->host.clip[3]);
     }
     if (minx > maxx || miny > maxy) return;
     if (gpu->state_version != g->state_version || gpu->state_context != ctxt) {
@@ -827,7 +826,7 @@ int gs_gpu_capture(Gs *g, uint32_t *pixels)
 {
     Gpu *p = g->backend;
     D3D11_MAPPED_SUBRESOURCE mapped;
-    if (p && p->native) return native_capture(p->native, pixels);
+    if (p && p->host.native) return native_capture(p->host.native, pixels);
     if (!p || !p->display_readback) return 0;
     ID3D11DeviceContext_CopyResource(p->context, (ID3D11Resource *)p->display_readback, (ID3D11Resource *)p->display);
     if (FAILED(ID3D11DeviceContext_Map(p->context, (ID3D11Resource *)p->display_readback, 0, D3D11_MAP_READ, 0, &mapped))) return 0;
@@ -973,7 +972,7 @@ int gs_gpu_init(Gs *g, ID3D11Device *device, ID3D11DeviceContext *context)
                                         &exact_device, NULL, &exact_context))) {
             int ok = exact_init(g, exact_device, exact_context);
             ID3D11DeviceContext_Release(exact_context); ID3D11Device_Release(exact_device);
-            if (ok && native_init(g, g->backend, device, context)) return 1;
+            if (ok && native_init(g, &((Gpu *)g->backend)->host, device, context)) return 1;
             if (ok) gs_gpu_destroy(g);
         }
         fprintf(stderr, "gs: native renderer unavailable; using the exact renderer\n");

@@ -178,7 +178,11 @@ typedef struct {
 
 typedef struct Native {
     NativeExactCache exact_state;
-    Gpu *exact;
+    /* The exact backend: where its clip is, and its draw and staged reads (g->draw, g->stage_pages
+       before the native renderer took them over). */
+    NativeHost *host;
+    void (*exact_draw)(Gs *g, unsigned prim, const GsVertex *vertices, unsigned count);
+    void (*exact_stage_pages)(Gs *g, const uint32_t want[16], uint32_t staged[16]);
     ID3D11Device *device;
     ID3D11DeviceContext *context;
     CRITICAL_SECTION context_lock;
@@ -433,7 +437,7 @@ static void native_claim(Native *n, Gs *g, int surface, unsigned psm, int x0, in
    and untouched pixels of partial uploads. Called before page_writes increments. */
 static void native_write_high(Gs *g, unsigned address, uint32_t value, uint32_t mask)
 {
-    Native *n = ((Gpu *)g->backend)->native;
+    Native *n = native_of(g);
     unsigned page = address / (8192 * 8);
     int owner = native_owner(n, g, page), x, y;
     if (owner < 0) return;
@@ -1099,7 +1103,7 @@ static int native_writes(const NativeLogDraw *d, unsigned zbp) { return d->zbp =
 static void native_clip(Native *n, const int rect[4])
 {
     static const int none[4] = {1, 1, 0, 0};
-    memcpy(n->exact->clip, rect ? rect : n->watch.on ? n->watch.rect : none, sizeof n->exact->clip);
+    memcpy(n->host->clip, rect ? rect : n->watch.on ? n->watch.rect : none, sizeof n->host->clip);
 }
 
 static void native_band_add(Native *n, unsigned page)
@@ -1198,7 +1202,7 @@ static void native_exact_replay(Native *n, Gs *g, const int rect[4], unsigned zb
             g->state_version = (1ull << 63) | ++n->replay_version;
             restored = d->state; restored_log = log; restored_masked = masked;
         }
-        draw(g, d->type, d->v, d->count);
+        n->exact_draw(g, d->type, d->v, d->count);
         n->stats.probe_replayed_draws++;
     }
     memcpy(g->reg, saved_reg, sizeof saved_reg); memcpy(g->clut, saved_clut, sizeof saved_clut);
@@ -1306,18 +1310,18 @@ static void native_exact(Native *n, Gs *g, unsigned type, const GsVertex *v, uns
     if (target) {
         static const int whole[4] = {0, 0, 2047, 2047};
         native_clip(n, whole);
-        draw(g, type, v, count);
+        n->exact_draw(g, type, v, count);
         n->stats.exact_draws++;
     } else if (watched && banded && native_overlap(band, n->watch.rect)) {
         const int *w = n->watch.rect;
         int both[4] = {band[0] < w[0] ? band[0] : w[0], band[1] < w[1] ? band[1] : w[1],
                        band[2] > w[2] ? band[2] : w[2], band[3] > w[3] ? band[3] : w[3]};
         native_clip(n, both);
-        draw(g, type, v, count);
+        n->exact_draw(g, type, v, count);
         n->stats.exact_draws++;
     } else {
-        if (watched) { native_clip(n, NULL); draw(g, type, v, count); n->stats.exact_draws++; }
-        if (banded) { native_clip(n, band); draw(g, type, v, count); n->stats.exact_draws++; }
+        if (watched) { native_clip(n, NULL); n->exact_draw(g, type, v, count); n->stats.exact_draws++; }
+        if (banded) { native_clip(n, band); n->exact_draw(g, type, v, count); n->stats.exact_draws++; }
     }
     native_clip(n, NULL);
 }
@@ -1363,8 +1367,7 @@ static unsigned native_probe_pieces(const int rect[4], unsigned psm, unsigned sb
 /* Deferred reads: a Z probe gets exact pixels; colour reads keep the CPU image (counted). */
 static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[16])
 {
-    Gpu *gpu = g->backend;
-    Native *n = gpu->native;
+    Native *n = native_of(g);
     uint64_t blt = g->reg[GS_BITBLTBUF], pos = g->reg[GS_TRXPOS], size = g->reg[GS_TRXREG];
     unsigned psm = (unsigned)(blt >> 24) & 63, sbp = (unsigned)blt & 0x3FFF, sbw = (unsigned)(blt >> 16) & 63;
     int rect[4] = {(int)(pos & 2047), (int)(pos >> 16 & 2047), 0, 0};
@@ -1418,15 +1421,14 @@ static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[1
             native_clip(n, NULL);
         }
     } else n->stats.color_reads++;
-    stage_pages(g, want, staged);
+    n->exact_stage_pages(g, want, staged);
 }
 
 /* ---- GS hooks ---- */
 
 static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
 {
-    Gpu *gpu = g->backend;
-    Native *n = gpu->native;
+    Native *n = native_of(g);
     unsigned prim = (unsigned)((g->reg[GS_PRIM] & 7) |
                     ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
     unsigned ctxt = prim >> 9 & 1;
@@ -1438,16 +1440,14 @@ static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
 /* A host upload must not become the starting content of an earlier pending draw. */
 static void native_flush_draw(Gs *g)
 {
-    Gpu *gpu = g->backend;
-    native_close(gpu->native, g);
+    native_close(native_of(g), g);
 }
 
 /* TRXDIR 2. Between rendered surfaces it is a GPU copy; otherwise the CPU copies GS memory
    (as gs.c would), so later texture decodes see it. */
 static int native_local_copy(Gs *g)
 {
-    Gpu *gpu = g->backend;
-    Native *n = gpu->native;
+    Native *n = native_of(g);
     n->upload_epoch++;
     /* Claim the pending source draw before deciding where the copy reads. */
     native_close(n, g);
@@ -1475,7 +1475,7 @@ static int native_local_copy(Gs *g)
         }
     }
     n->stats.copy_fallbacks++;
-    sync_range(g, sbp * 256, 4 * 1024 * 1024);
+    g->sync_range(g, sbp * 256, 4 * 1024 * 1024);
     for (unsigned y = 0; y < height; y++) for (unsigned x = 0; x < width; x++) {
         unsigned ex = p >> 59 & 1 ? width - 1 - x : x, ey = p >> 60 & 1 ? height - 1 - y : y;
         uint32_t v = gs_read_pixel(g, spsm, sbp, sbw, (sx + ex) & 2047, (sy + ey) & 2047);
@@ -2489,7 +2489,7 @@ static unsigned __stdcall native_thread(void *argument)
    present options read again. */
 void gs_native_lock(Gs *g, int lock)
 {
-    Native *n = ((Gpu *)g->backend)->native;
+    Native *n = native_of(g);
     if (lock) EnterCriticalSection(&n->context_lock);
     else LeaveCriticalSection(&n->context_lock);
 }
@@ -2497,7 +2497,7 @@ void gs_native_lock(Gs *g, int lock)
 static HRESULT native_present_options(Native *n);
 void gs_native_present_options(Gs *g)
 {
-    Native *n = ((Gpu *)g->backend)->native;
+    Native *n = native_of(g);
     EnterCriticalSection(&n->context_lock);
     native_present_options(n);
     LeaveCriticalSection(&n->context_lock);
@@ -2505,7 +2505,7 @@ void gs_native_present_options(Gs *g)
 
 int gs_gpu_native(const Gs *g)
 {
-    return g && g->backend && ((const Gpu *)g->backend)->native != NULL;
+    return g && g->backend && native_of(g) != NULL;
 }
 
 void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned *height, int resize)
@@ -2524,8 +2524,7 @@ void gs_native_vsync(Gs *g, IDXGISwapChain *swapchain, unsigned *width, unsigned
         FILE *draws = native_field_trace("draws");
         if (draws) fflush(draws);
     }
-    Gpu *gpu = g->backend;
-    Native *n = gpu->native;
+    Native *n = native_of(g);
     n->upload_epoch++;
     NativeFrame *f = n->recording;
     native_close(n, g);
@@ -2667,7 +2666,7 @@ static uint32_t *native_window_picture(Native *n, unsigned *width, unsigned *hei
 
 void gs_native_movie(Gs *g, const uint32_t *rgba, unsigned width, unsigned height)
 {
-    NativeFrame *f = ((Gpu *)g->backend)->native->recording;
+    NativeFrame *f = native_of(g)->recording;
     f->movie_on = 0;
     if (!rgba || !width || !height) return;
     if ((size_t)width * height > f->movie_capacity) {
@@ -2681,7 +2680,7 @@ void gs_native_movie(Gs *g, const uint32_t *rgba, unsigned width, unsigned heigh
 
 uint32_t *gs_native_picture(Gs *g, unsigned *width, unsigned *height)
 {
-    Native *n = ((Gpu *)g->backend)->native;
+    Native *n = native_of(g);
     return native_picture_read(n, width, height) ? native_window_picture(n, width, height) : NULL;
 }
 
@@ -2717,7 +2716,7 @@ static void native_intervals(Native *n, const char *label, uint64_t presented, u
 void gs_native_bench(Gs *g, int end)
 {
     if (!gs_gpu_native(g)) return;
-    Native *n = ((Gpu *)g->backend)->native;
+    Native *n = native_of(g);
     EnterCriticalSection(&n->context_lock);
     if (!end) {
         n->interval_count = 0; n->last_present = 0;
@@ -2808,11 +2807,11 @@ static HRESULT native_present_options(Native *n)
     return S_OK;
 }
 
-static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceContext *context)
+static int native_init(Gs *g, NativeHost *host, ID3D11Device *device, ID3D11DeviceContext *context)
 {
     Native *n = calloc(1, sizeof *n);
     if (!n) return 0;
-    n->exact = exact; n->device = device; n->context = context;
+    n->host = host; n->device = device; n->context = context;
     InitializeCriticalSection(&n->context_lock);
     InitializeCriticalSection(&n->queue_lock);
     InitializeConditionVariable(&n->queue_changed);
@@ -2921,9 +2920,10 @@ static int native_init(Gs *g, Gpu *exact, ID3D11Device *device, ID3D11DeviceCont
         hr = S_OK;
     }
     ID3D11Device_AddRef(device); ID3D11DeviceContext_AddRef(context);
-    exact->native = n;
-    exact->clip[0] = exact->clip[1] = 1; exact->clip[2] = exact->clip[3] = 0;  /* nothing until a probe */
-    exact->clip_on = 1;
+    host->native = n;
+    host->clip[0] = host->clip[1] = 1; host->clip[2] = host->clip[3] = 0;  /* nothing until a probe */
+    host->clip_on = 1;
+    n->exact_draw = g->draw; n->exact_stage_pages = g->stage_pages;
     g->draw = native_draw;
     g->local_copy = native_local_copy;
     g->flush_draw = native_flush_draw;

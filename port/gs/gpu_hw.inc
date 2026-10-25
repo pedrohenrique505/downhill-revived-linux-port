@@ -28,7 +28,7 @@ static unsigned hardware_state_rejection(Gs *g, unsigned ctxt)
 static unsigned hardware_rejection(Gpu *p)
 {
     if (!p->raster_stats.hardware_enabled) return GS_GPU_HW_DISABLED;
-    if (p->clip_on) return GS_GPU_HW_DISABLED;  /* clipped probe work is small: compute */
+    if (p->host.clip_on) return GS_GPU_HW_DISABLED;  /* clipped probe work is small: compute */
     if (!p->raster_stats.hardware_available) return GS_GPU_HW_UNAVAILABLE;
     if (p->hardware_rejection != GS_GPU_HW_REASON_COUNT) return p->hardware_rejection;
     for (unsigned i = 0; i < p->pending_count; i++) {
