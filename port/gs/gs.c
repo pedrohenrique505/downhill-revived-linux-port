@@ -178,6 +178,7 @@ size_t gs_read_image(Gs *g, void *destination, size_t bytes)
     unsigned psm = field(blt, 24, 63), bp = field(blt, 0, 0x3FFF), bw = field(blt, 16, 63);
     unsigned width = field(size, 0, 4095), height = field(size, 32, 4095), bits = gs_bits_per_pixel(psm);
     if ((g->reg[GS_TRXDIR] & 3) != 1 || !width || !height || !bits) return 0;
+    if (g->record_read) g->record_read(bytes);
     if (!g->sync_range) sync_memory(g);
     else if (!g->transfer_count && !g->transfer_have) {
         /* The pages the rectangle covers: GS pages are at least 64x32 pixels, so a 16-pixel grid
@@ -242,6 +243,7 @@ size_t gs_defer_read_image(Gs *g, void *destination, size_t bytes)
         if (want[page / 32] & deferred.captured[page / 32] & (1u << (page & 31)) && deferred.epoch[page] != now)
             stale = 1;
     if (stale) return 0;  /* the caller settles the earlier reads and tries again */
+    if (g->record_read) g->record_read(bytes);
     for (unsigned i = 0; i < 16; i++) want[i] &= ~deferred.captured[i];
     g->stage_pages(g, want, staged);
     for (unsigned page = 0; page < 512; page++) {

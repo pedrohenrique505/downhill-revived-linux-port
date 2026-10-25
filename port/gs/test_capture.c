@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#define _putenv_s(name, value) setenv(name, value, 1)
+#endif
 
 static unsigned failures;
 #define CHECK(c) do { if (!(c)) { printf("FAIL capture line %d\n", __LINE__); failures++; } } while (0)
@@ -13,6 +16,8 @@ void hle_log(const char *fmt, ...) { (void)fmt; }
 int gs_gpu_display(Gs *g, unsigned *w, unsigned *h) { (void)g; (void)w; (void)h; return 0; }
 int gs_gpu_capture(Gs *g, uint32_t *pixels) { (void)g; (void)pixels; return 0; }
 static uint32_t read32(FILE *f) { uint32_t v = 0; CHECK(fread(&v, 4, 1, f) == 1); return v; }
+static void stage_cpu(Gs *g, const uint32_t want[16], uint32_t staged[16])
+{ (void)g; (void)want; memset(staged, 0, 16 * sizeof *staged); }
 
 int main(int argc, char **argv)
 {
@@ -35,6 +40,23 @@ int main(int argc, char **argv)
     /* Two fragments become exactly two complete transfer qwords. */
     uint32_t packet[] = {0x8001, 1u << 28, 14, 0, 0x12345678, 0, GS_FOGCOL, 0};
     gs_feed(&gs, 3, packet, 2); gs_feed(&gs, 3, packet + 2, 6);
+    /* A read must follow the queued setup/draw packets in the dump. Both an
+       immediate read and a successfully deferred read occur at issue time. */
+    uint32_t setup[] = {0x8004, 1u << 28, 14, 0,
+        1u << 16, 0, GS_BITBLTBUF, 0,
+        2 | 1u << 16, 0, GS_TRXPOS, 0,
+        4, 1, GS_TRXREG, 0,
+        1, 0, GS_TRXDIR, 0};
+    uint32_t reset[] = {0x8001, 1u << 28, 14, 0, 1, 0, GS_TRXDIR, 0};
+    uint32_t immediate[4] = {0}, deferred[4] = {0};
+    gs_feed(&gs, 3, setup, sizeof setup / sizeof *setup);
+    CHECK(gs_read_image(&gs, immediate, sizeof immediate) == sizeof immediate);
+    CHECK(immediate[0] == 0x80765432);
+    gs_feed(&gs, 3, reset, sizeof reset / sizeof *reset);
+    gs.stage_pages = stage_cpu;
+    CHECK(gs_defer_read_image(&gs, deferred, sizeof deferred) == sizeof deferred);
+    gs_settle_reads(&gs);
+    CHECK(!memcmp(immediate, deferred, sizeof immediate));
     for (unsigned i = 1; i < fields; i++) { ++kernel_vsync_count; gs_vblank(&gs); gs_capture_vsync(&gs); }
     CHECK(!gs.record_transfer);
     char name[1024]; snprintf(name, sizeof name, "%s/frame-000.gs", argv[1]);
@@ -46,9 +68,16 @@ int main(int argc, char **argv)
     fseek(f, 8 + state_size + 8192, SEEK_SET);
     CHECK(fgetc(f) == 3); fseek(f, 8192, SEEK_CUR);
     CHECK(fgetc(f) == 1); CHECK(fgetc(f) == 0);
-    CHECK(fgetc(f) == 0 && fgetc(f) == 3 && read32(f) == 32);
+    CHECK(fgetc(f) == 0 && fgetc(f) == 3 && read32(f) == 32 + sizeof setup);
     uint32_t words[8]; CHECK(fread(words, 32, 1, f) == 1);
     CHECK(memcmp(words, packet, 32) == 0);
+    uint32_t recorded[20]; CHECK(fread(recorded, sizeof setup, 1, f) == 1);
+    CHECK(!memcmp(recorded, setup, sizeof setup));
+    CHECK(fgetc(f) == 2 && read32(f) == 1);
+    CHECK(fgetc(f) == 0 && fgetc(f) == 3 && read32(f) == sizeof reset);
+    CHECK(fread(recorded, sizeof reset, 1, f) == 1);
+    CHECK(!memcmp(recorded, reset, sizeof reset));
+    CHECK(fgetc(f) == 2 && read32(f) == 1);
     for (unsigned i = 0; i < fields-1; i++) {
         CHECK(fgetc(f) == 3); fseek(f, 8192, SEEK_CUR);
         CHECK(fgetc(f) == 1); CHECK(fgetc(f) == (int)((i + 1) & 1));

@@ -322,5 +322,13 @@ void gs_vsync(void)
     pacing_handed(&due, &began);
     pacing_present(due, began);
     present();
+    extern uint64_t kernel_vsync_count;
+    race_sync_vsync(kernel_vsync_count);
+    if (getenv("DHD_RACE_SYNC") && getenv("DHD_RACE_GSDUMP")) {
+        char name[1024];
+        /* The shared race-clock scheduler requests the GS dump as on Windows.
+           capture.c saves the matching native pictures with that dump. */
+        race_sync_capture("", name, sizeof name);
+    }
     gs_capture_vsync(&gs);
 }

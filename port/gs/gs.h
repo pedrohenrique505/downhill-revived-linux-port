@@ -77,6 +77,8 @@ struct Gs {
     void (*flush_draw)(Gs *gs);
     /* Optional native high-byte overlay, before the CPU word/page version changes. */
     void (*write_high)(Gs *gs, unsigned bit_address, uint32_t value, uint32_t mask);
+    /* Capture a FIFO read at issue time, including a successfully deferred read. */
+    void (*record_read)(size_t bytes);
 };
 extern Gs gs;
 

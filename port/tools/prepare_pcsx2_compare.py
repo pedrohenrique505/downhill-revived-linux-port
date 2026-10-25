@@ -103,7 +103,9 @@ static bool DhdRaceSync()
                 char path[1024];
                 std::snprintf(path, sizeof path, "%s/gs-%c%+ld.png", gsdump, *cursor, value);
                 std::string target(path);
+#ifdef _WIN32
                 std::replace(target.begin(), target.end(), '/', '\\');  // OpenCFile opens \\?\ paths, which keep '/'
+#endif
                 MTGS::RunOnGSThread([target]() {
                     GSConfig.GSDumpCompression = GSDumpCompressionMethod::Uncompressed;
                     GSQueueSnapshot(target, 2);

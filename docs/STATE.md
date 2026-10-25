@@ -1970,3 +1970,12 @@ synchronous FIFO response export. Fresh race fields 3000–3002 reproduce identi
 RGB through Vulkan replay; those fields have no FIFO reads. Nine comparison tests
 pass. PCSX2 picture/outlier and independent retail acceptance remain in progress;
 no final image MATCH is claimed.
+
+Finding 080 continuation: fixed constant Gouraud alpha truncation with a synthetic
+GPU regression (red before / green after), eliminating four original riding outliers.
+The remaining doubled GS pixel is traced to PCSX2 software floating-point left-edge
+rounding; exact follows the documented GS inclusion rule. Native dumps now record
+immediate/deferred FIFO reads in order (capture test red before / green after), and
+Linux race-clock captures work. Live GO+10 s readbacks match PCSX2 byte for byte;
+the updated build completes a bounded race at 59.062 fields/s. Independent retail
+boot/GS-stream checks continue; no final issue acceptance is claimed.

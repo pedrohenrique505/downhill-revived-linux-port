@@ -84,6 +84,40 @@ for future outliers. Relevant evidence is in `triangle-edge/`,
 `triangle-edge-check/`, `triangle-edge-probe/`, `probe-z.log` and
 `pcsx2-z-probe/`, all under `build/port/issue1-picture/`.
 
+## Capturing real reads and race-clock moments
+
+The old native capture writer emitted GIF, register and VSync records but never
+FIFO read records. Empty replay transcripts therefore could not establish
+readback correctness. `Gs.record_read` now records successful immediate/deferred
+read requests at issue time, flushing earlier GIF packets before the read marker.
+The callback is absent in ordinary play. Deferred settlement does not emit a
+second marker. Non-qword diagnostic requests are refused rather than rounded.
+
+The capture regression exercises both public read APIs and verifies packet/read
+ordering. It fails against pristine pre-fix sources (11 failures with the final
+test), passes after the fix, and its two reads match PCSX2's 40-byte transcript
+(two length headers plus 32 payload bytes). Linux `test_vulkan.py` now runs it.
+All GPU/GS tests remain green. The Linux presenter also invokes the existing
+race-clock capture scheduler; PCSX2 dump paths convert separators only on Windows.
+
+Full Linux link: 4,580 objects, zero duplicates/other link errors, 23 existing SDK
+stubs, no unresolved symbols after stub linkage. Fresh live captures at countdown
++120, GO+30 and GO+600 are in `native-race/`. GO+600 contains a real 64-byte read;
+its 68-byte transcript (length header included) matches PCSX2. The two-field
+race captures can still display a buffer inherited from the freeze, so zero
+image error there alone is not independent raster evidence. The earlier eight-field
+check and the independent retail GS stream are needed for that.
+
+The live run reaches field 4,720 and exits through `DHD_BENCH_EXIT` without a crash:
+fields 4,700–4,720 deliver 59.062 fields/s. This is a short loaded-race field
+measurement, not a new claim about unique rendered FPS.
+
+Independent retail PCSX2 boot completed the same NAV/seed and captured countdown,
+GO+0.5 s and GO+10 s. Existing race window (five fields) and line correction
+produce MAE 3.891, 7.312 and 3.489 respectively; these are **not** strict image
+matches. Differences in game state/camera still contribute. Direct retail GS
+stream comparisons are recorded separately below; no tolerance is widened.
+
 ## Sources
 
 - [PCSX2 2.8.2 source](https://github.com/PCSX2/pcsx2/tree/v2.8.2), pinned at

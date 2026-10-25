@@ -34,6 +34,18 @@ static void transfer(unsigned path, const uint32_t *qword)
     memcpy(packet + packet_words, qword, 16); packet_words += 4;
 }
 
+static void read_fifo(size_t size)
+{
+    /* Hardware FIFO requests are whole qwords. Refuse an unrepresentable
+       diagnostic read instead of silently creating a misleading capture. */
+    if ((size & 15) || size / 16 > UINT32_MAX) {
+        fprintf(stderr, "gs: capture cannot record a non-qword FIFO request\n");
+        abort();
+    }
+    flush_transfer();
+    u8(2); u32((uint32_t)(size / 16));
+}
+
 static void registers(Gs *g)
 {
     uint8_t priv[8192] = {0};
@@ -149,6 +161,7 @@ void gs_capture_vsync(Gs *g)
         setvbuf(dump, NULL, _IOFBF, 1024 * 1024);
         initial_state(g); frames = 0;
         g->record_transfer = transfer;
+        g->record_read = read_fifo;
     }
     flush_transfer();
     u8(3); registers(g); u8(1); u8((unsigned)(gs_priv_read(g, GS_CSR) >> 13) & 1);
@@ -157,7 +170,7 @@ void gs_capture_vsync(Gs *g)
     fprintf(stderr, "compare: dump %s field=%u vsync=%llu host=%.6f game=%.6f\n", prefix, frames,
             (unsigned long long)kernel_vsync_count, host_wall_seconds(), host_seconds());
     if (++frames == length) {
-        fclose(dump); dump = NULL; g->record_transfer = NULL;
+        fclose(dump); dump = NULL; g->record_transfer = NULL; g->record_read = NULL;
         if (directory) next += interval;
         hle_log("gs: captured %s.gs and %u matching native fields\n", prefix, length);
     }

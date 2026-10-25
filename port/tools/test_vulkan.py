@@ -22,17 +22,24 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     generate(out / 'gs_spirv.h')
     common = [os.environ.get('CC', 'clang'), '-m32', '-O2', '-msse2',
-              '-ffp-contract=off', '-Wall', '-Wextra', '-I', str(out)]
+              '-ffp-contract=off', '-Wall', '-Wextra', '-I', str(out),
+              '-I', str(ROOT / 'port/include'), '-I', str(ROOT / 'port/platform/linux/include')]
     core = [str(ROOT / 'port/gs' / name) for name in ('gs.c', 'memory.c', 'display.c')]
     tests = {
         'gs': [str(ROOT / 'port/gs/test_gs.c'), *core],
+        'capture': [str(ROOT / 'port/gs/test_capture.c'), str(ROOT / 'port/gs/capture.c'), *core],
         'vulkan': [str(ROOT / 'port/gs/test_gpu.c'), str(ROOT / 'port/platform/linux/gpu.c'), *core, '-lvulkan'],
     }
     for name, sources in tests.items():
         executable = out / name
         subprocess.run([*common, *sources, '-o', str(executable)], check=True)
         if not args.build_only:
-            subprocess.run([str(executable)], check=True, timeout=120)
+            extra = []
+            if name == 'capture':
+                captures = out / 'captures'
+                captures.mkdir(exist_ok=True)
+                extra = [str(captures)]
+            subprocess.run([str(executable), *extra], check=True, timeout=120)
 
 
 if __name__ == '__main__':
