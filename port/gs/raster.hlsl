@@ -264,8 +264,13 @@ void draw_pixel(uint2 xy, Primitive d) {
         int2 d = b - a;
         int major = max(abs(d.x), abs(d.y));
         if (!major) return;
-        float along = abs(d.x) >= abs(d.y) ? (float)(p.x - a.x) / d.x : (float)(p.y - a.y) / d.y;
-        if (along < 0 || along >= 1 || abs((float)edge(a,b,p)) >= major * 8.0) return;
+        int distance = abs(d.x) >= abs(d.y) ? d.x : d.y;
+        int step = abs(d.x) >= abs(d.y) ? p.x - a.x : p.y - a.y;
+        // Test the half-open segment in integer GS coordinates: Vulkan division
+        // may round endpoint/length just below 1, incorrectly including the end.
+        if (distance > 0 ? (step < 0 || step >= distance) : (step > 0 || step <= distance)) return;
+        float along = (float)step / distance;
+        if (abs((float)edge(a,b,p)) >= major * 8.0) return;
         weight = float3(1 - along, along, 0);
     } else {
         if (any(p < min(a,min(b,c))) || any(p > max(a,max(b,c)))) return;
