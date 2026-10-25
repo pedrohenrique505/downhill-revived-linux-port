@@ -211,7 +211,11 @@ int4 sample_level(float2 st, uint ctxt, uint level, bool filtered) {
         int2 p = (int2)floor(at), f = (int2)(frac(at) * 16);
         int4 a = texel(p, ctxt, level), b = texel(p + int2(1,0), ctxt, level);
         int4 c = texel(p + int2(0,1), ctxt, level), d = texel(p + 1, ctxt, level);
-        result = ((a * (16 - f.x) + b * f.x) * (16 - f.y) + (c * (16 - f.x) + d * f.x) * f.y) >> 8;
+        // GS filtering truncates between the horizontal and vertical lerps.
+        // A single combined shift can add an alpha unit and change ATST.
+        int4 top = (a * (16 - f.x) + b * f.x) >> 4;
+        int4 bottom = (c * (16 - f.x) + d * f.x) >> 4;
+        result = (top * (16 - f.y) + bottom * f.y) >> 4;
     } else result = texel((int2)floor(st), ctxt, level);
     return result;
 }

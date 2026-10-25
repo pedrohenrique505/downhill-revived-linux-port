@@ -425,6 +425,26 @@ static void gouraud_alpha_threshold(void)
     CHECK(at(16,1) == 0x41808080);
 }
 
+static void bilinear_alpha_threshold(void)
+{
+    gs_write(&gs, GS_FRAME_1, 1u << 16);
+    gs_write(&gs, GS_ZBUF_1, UINT64_C(1) << 32);
+    gs_write(&gs, GS_TEST_1, 0);
+    sprite(0, 0x80112233, 0,0,2,1,0);
+    /* GS bilinear filtering truncates after each axis. At (1,1), horizontal
+       results 64 and 65 then give 64; a single 2D truncation gives 65. */
+    for (unsigned y = 0; y < 2; y++) for (unsigned x = 0; x < 2; x++)
+        gs_write_pixel(&gs, 0,1024,1,x,y,0x00808080 | (64 + x + y) << 24);
+    gs_write(&gs, GS_TEX0_1, 1024 | 1u << 14 | 1u << 26 | UINT64_C(1) << 30 | UINT64_C(1) << 34);
+    gs_write(&gs, GS_TEX1_1, 32); gs_write(&gs, GS_CLAMP_1, 5);
+    gs_write(&gs, GS_UV, 16 | UINT64_C(16) << 16);
+    sprite(16 | 256, 0x80808080, 0,0,1,1,0);
+    CHECK(at(0,0) == 0x40808080);
+    gs_write(&gs, GS_TEST_1, 1 | 6u << 1 | 64u << 4);
+    sprite(16 | 256, 0x80808080, 1,0,1,1,0);
+    CHECK(at(1,0) == 0x80112233);
+}
+
 int main(void)
 {
 #ifndef __linux__
@@ -595,6 +615,7 @@ int main(void)
     deferred_reads();
     deferred_read_waits();
     gouraud_alpha_threshold();
+    bilinear_alpha_threshold();
 #ifdef __linux__
     queued_states();
     aliased_states();

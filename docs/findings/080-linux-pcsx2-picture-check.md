@@ -118,6 +118,23 @@ produce MAE 3.891, 7.312 and 3.489 respectively; these are **not** strict image
 matches. Differences in game state/camera still contribute. Direct retail GS
 stream comparisons are recorded separately below; no tolerance is widened.
 
+## Bilinear filtering before alpha test
+
+An independent-retail GO+30 stream exposed an interior-pixel difference at
+GS (429,166), doubled to display y=332/333, maximum channel error 47. Native
+draw 6,187 has vertices (35472,33621), (35609,33636), (35539,33650). The sample
+lies strictly inside (edge values 742,583,1643; area 2968), so this is not the
+documented coverage exception.
+
+The shared shader truncated the 2D bilinear weighted sum only once. PCSX2's
+software `lerp16_4` truncates the horizontal result before the vertical step.
+For synthetic texel alphas [[64,65],[65,66]] at half/half, the old shader yields
+65 rather than 64, incorrectly passing ATST GREATER 64. Both the literal sample
+assertion and the discard assertion fail before the fix, and pass after it.
+All existing GPU fixtures pass unchanged. This second fix removes the interior
+retail-stream outlier; the complete stream's field 1 maximum falls 47 -> 10.
+A separate doubled pixel in field 3 remains under investigation at this step.
+
 ## Sources
 
 - [PCSX2 2.8.2 source](https://github.com/PCSX2/pcsx2/tree/v2.8.2), pinned at
