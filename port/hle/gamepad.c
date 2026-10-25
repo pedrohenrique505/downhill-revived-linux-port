@@ -17,6 +17,9 @@
 #include "hle.h"
 
 #include <SDL3/SDL.h>
+#ifdef __linux__
+#include "../platform/linux/sdl_events.h"
+#endif
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,7 +192,14 @@ static DWORD WINAPI sdl_thread(void *unused)
     for (int first = 1;; first = 0) {
         SDL_Event e;
         /* wakes on any input; 4 ms at most, so the vibration is never late */
+#ifdef __linux__
+        SDL_Delay(4);
+        /* With a video window, only its thread may pump SDL's native events. */
+        if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_PumpEvents();
+        while (linux_gamepad_event(&e)) {
+#else
         for (int got = SDL_WaitEventTimeout(&e, 4); got; got = SDL_PollEvent(&e)) {
+#endif
             if (e.type == SDL_EVENT_JOYSTICK_ADDED) attach(e.jdevice.which);
             else if (e.type == SDL_EVENT_JOYSTICK_REMOVED) detach(e.jdevice.which);
             else if (e.type == SDL_EVENT_GAMEPAD_ADDED || e.type == SDL_EVENT_GAMEPAD_REMAPPED) remap(e.gdevice.which);
