@@ -3,7 +3,12 @@
    live until the native fence completes. Positive-height viewports pair with DXC's invert-y.
    Offscreen scanout/readback are supported here; window presentation belongs to the host. */
 #include "native_gpu.h"
+#include "../../gs/present.h"
+void pacing_present(double due, double began);
 #include <vulkan/vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -24,6 +29,14 @@ typedef struct Pipeline { struct Pipeline *next; uint32_t blend; unsigned depth,
 typedef struct {
     VkInstance instance;
     VkDebugUtilsMessengerEXT debug;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkImage *backbuffers;
+    VkSemaphore *finished, acquired;
+    unsigned image_count, family, width, height;
+    unsigned window_width, window_height; /* published by the SDL/window thread */
+    VkPresentModeKHR present_mode;
+    int recreate, point;
     VkPhysicalDevice physical;
     VkDevice device;
     VkQueue queue;
@@ -482,14 +495,148 @@ int native_gpu_read(Native *n, uint32_t *pixels)
     vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
     submit(v); retire(v); memcpy(pixels, v->readback.map, size); return 1;
 }
-unsigned native_gpu_window_height(Native *n) { (void)n; return 0; }
-int native_gpu_present(Native *n) { (void)n; return 0; } /* offscreen backend */
+/* SDL window APIs stay on the EE thread; Vulkan presentation stays on native_thread. */
+void native_vulkan_window_size(Native *n, unsigned width, unsigned height)
+{
+    NativeVk *v = n->gpu;
+    __atomic_store_n(&v->window_width, width, __ATOMIC_RELEASE);
+    __atomic_store_n(&v->window_height, height, __ATOMIC_RELEASE);
+}
+unsigned native_gpu_window_height(Native *n)
+{
+    NativeVk *v = n->gpu;
+    return __atomic_load_n(&v->window_height, __ATOMIC_ACQUIRE);
+}
+static void swapchain_free(NativeVk *v)
+{
+    if (!v->swapchain) return;
+    /* Presentation has its own lifetime beyond the submission fence. */
+    VK_CALL(vkDeviceWaitIdle(v->device));
+    for (unsigned i = 0; i < v->image_count; i++) vkDestroySemaphore(v->device, v->finished[i], NULL);
+    free(v->finished); free(v->backbuffers);
+    v->finished = NULL; v->backbuffers = NULL; v->image_count = 0;
+    vkDestroySwapchainKHR(v->device, v->swapchain, NULL); v->swapchain = VK_NULL_HANDLE;
+}
+static int swapchain_create(Native *n)
+{
+    NativeVk *v = n->gpu;
+    unsigned w = __atomic_load_n(&v->window_width, __ATOMIC_ACQUIRE);
+    unsigned h = __atomic_load_n(&v->window_height, __ATOMIC_ACQUIRE);
+    if (!w || !h) return 0;
+    if (v->swapchain && !v->recreate && w == v->width && h == v->height) return 1;
+    submit(v); retire(v); swapchain_free(v);
+    VkSurfaceCapabilitiesKHR caps;
+    VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(v->physical, v->surface, &caps));
+    VkExtent2D extent = caps.currentExtent;
+    if (extent.width == UINT32_MAX) {
+        extent.width = w < caps.minImageExtent.width ? caps.minImageExtent.width : w > caps.maxImageExtent.width ? caps.maxImageExtent.width : w;
+        extent.height = h < caps.minImageExtent.height ? caps.minImageExtent.height : h > caps.maxImageExtent.height ? caps.maxImageExtent.height : h;
+    }
+    if (!extent.width || !extent.height) return 0;
+    uint32_t count = 0;
+    VK_CALL(vkGetPhysicalDeviceSurfaceFormatsKHR(v->physical, v->surface, &count, NULL));
+    VkSurfaceFormatKHR *formats = calloc(count, sizeof *formats); if (!formats) abort();
+    VK_CALL(vkGetPhysicalDeviceSurfaceFormatsKHR(v->physical, v->surface, &count, formats));
+    VkSurfaceFormatKHR format = {0};
+    for (unsigned i = 0; i < count; i++)
+        if ((formats[i].format == VK_FORMAT_R8G8B8A8_UNORM || formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) &&
+            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { format = formats[i]; break; }
+    free(formats);
+    VkFormatProperties properties; vkGetPhysicalDeviceFormatProperties(v->physical, format.format, &properties);
+    if (!format.format || !(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+        !(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        fprintf(stderr, "gs native Vulkan: surface requires UNORM transfer/blit destination support\n"); exit(1);
+    }
+    v->present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    /* The field clock or DHD_INTERP_HZ paces these modes; otherwise the display does. */
+    const char *vsync = getenv("DHD_VSYNC");
+    int fifo = n->interp ? !n->interp_hz : vsync && atoi(vsync) != 0;
+    if (!fifo) {
+        VK_CALL(vkGetPhysicalDeviceSurfacePresentModesKHR(v->physical, v->surface, &count, NULL));
+        VkPresentModeKHR *modes = calloc(count, sizeof *modes); if (!modes) abort();
+        VK_CALL(vkGetPhysicalDeviceSurfacePresentModesKHR(v->physical, v->surface, &count, modes));
+        for (unsigned i = 0; i < count; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) v->present_mode = modes[i];
+        for (unsigned i = 0; i < count; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) v->present_mode = modes[i];
+        free(modes);
+    }
+    unsigned images = caps.minImageCount + 1;
+    if (caps.maxImageCount && images > caps.maxImageCount) images = caps.maxImageCount;
+    VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & alpha)) alpha = caps.supportedCompositeAlpha & -caps.supportedCompositeAlpha;
+    VkSwapchainCreateInfoKHR c = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = v->surface, .minImageCount = images, .imageFormat = format.format, .imageColorSpace = format.colorSpace,
+        .imageExtent = extent, .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .compositeAlpha = alpha, .presentMode = v->present_mode, .clipped = VK_TRUE};
+    VK_CALL(vkCreateSwapchainKHR(v->device, &c, NULL, &v->swapchain));
+    VK_CALL(vkGetSwapchainImagesKHR(v->device, v->swapchain, &v->image_count, NULL));
+    v->backbuffers = calloc(v->image_count, sizeof *v->backbuffers);
+    v->finished = calloc(v->image_count, sizeof *v->finished);
+    if (!v->backbuffers || !v->finished) abort();
+    VK_CALL(vkGetSwapchainImagesKHR(v->device, v->swapchain, &v->image_count, v->backbuffers));
+    VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (unsigned i = 0; i < v->image_count; i++) VK_CALL(vkCreateSemaphore(v->device, &sem, NULL, &v->finished[i]));
+    v->width = w; v->height = h; v->recreate = 0;
+    /* Actual surface extent can differ from the last SDL event during resize. */
+    v->width = extent.width; v->height = extent.height;
+    fprintf(stderr, "gs native Vulkan: swapchain %ux%u mode=%u images=%u\n", v->width, v->height, v->present_mode, v->image_count);
+    return 1;
+}
+int native_gpu_present(Native *n)
+{
+    NativeVk *v = n->gpu;
+    if (!v->surface || !v->display.image || !swapchain_create(n)) return 0;
+    begin(v); /* retires the previous submission before reusing the acquire semaphore */
+    uint32_t index;
+    VkResult r = vkAcquireNextImageKHR(v->device, v->swapchain, 100000000, v->acquired, VK_NULL_HANDLE, &index);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { v->recreate = 1; return 0; }
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) return 0;
+    if (r != VK_SUBOPTIMAL_KHR) vk_require(r, "vkAcquireNextImageKHR");
+    else v->recreate = 1;
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = v->backbuffers[index], .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkClearColorValue black = {.float32 = {0,0,0,1}};
+    vkCmdClearColorImage(v->cmd, b.image, b.newLayout, &black, 1, &range); barrier(v);
+    float fw, fh; native_viewport(n, v->width, v->height, &fw, &fh);
+    int x = (int)floorf((v->width-fw)/2), y = (int)floorf((v->height-fh)/2);
+    int sx = 0, sy = 0, sw = v->display.w, sh = v->display.h;
+    int view = gs_native_view - 1;
+    if (view >= 0 && view < 4) { sw /= 2; sh /= 2; sx = (view & 1)*sw; sy = (view >> 1)*sh; }
+    VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+        .srcOffsets = {{sx,sy,0},{sx+sw,sy+sh,1}}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+        .dstOffsets = {{x,y,0},{x+(int)fw,y+(int)fh,1}}};
+    vkCmdBlitImage(v->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, b.image, b.newLayout,
+        1, &blit, v->point ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    b.oldLayout = b.newLayout; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = 0;
+    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VK_CALL(vkEndCommandBuffer(v->cmd)); VK_CALL(vkResetFences(v->device, 1, &v->fence));
+    VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &v->acquired, .pWaitDstStageMask = &wait, .commandBufferCount = 1,
+        .pCommandBuffers = &v->cmd, .signalSemaphoreCount = 1, .pSignalSemaphores = &v->finished[index]};
+    VK_CALL(vkQueueSubmit(v->queue, 1, &submit_info, v->fence)); v->recording = 0; v->pending = 1;
+    if (!n->interp) pacing_present(n->present_due, n->present_began);
+    VkPresentInfoKHR present = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &v->finished[index], .swapchainCount = 1, .pSwapchains = &v->swapchain, .pImageIndices = &index};
+    r = vkQueuePresentKHR(v->queue, &present);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) v->recreate = 1;
+    else vk_require(r, "vkQueuePresentKHR");
+    return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+}
 void native_gpu_wait(Native *n) { (void)n; }
-int native_gpu_present_filter(Native *n, int point) { (void)n; (void)point; return 1; }
+int native_gpu_present_filter(Native *n, int point)
+{
+    NativeVk *v = n->gpu; v->point = point; v->recreate = 1; return 1;
+}
 void native_gpu_time(Native *n, int stage, const NativeFrame *f, float t, float cpu_ms)
 { (void)n; (void)stage; (void)f; (void)t; (void)cpu_ms; }
 
-static int native_device_supported(VkPhysicalDevice physical, unsigned *family)
+static int native_device_supported(VkPhysicalDevice physical, VkSurfaceKHR surface, unsigned *family)
 {
     VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(physical, &f);
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(physical, &p);
@@ -512,7 +659,11 @@ static int native_device_supported(VkPhysicalDevice physical, unsigned *family)
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, q);
     int found = 0;
     for (unsigned j = 0; j < count; j++) if ((q[j].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
-        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { *family = j; found = 1; break; }
+        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
+        VkBool32 supported = VK_TRUE;
+        if (surface) vkGetPhysicalDeviceSurfaceSupportKHR(physical, j, surface, &supported);
+        if (supported) { *family = j; found = 1; break; }
+    }
     free(q); return found;
 }
 static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -521,7 +672,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeve
     (void)severity; (void)type; (void)user;
     fprintf(stderr, "Vulkan validation: %s\n", data->pMessage); return VK_FALSE;
 }
-int gs_vulkan_native(Gs *g)
+int gs_vulkan_native_window(Gs *g, SDL_Window *window)
 {
     if (!g || !g->backend || !g->draw) return 0;
     if (native_of(g)) return 1;
@@ -535,9 +686,17 @@ int gs_vulkan_native(Gs *g)
         .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
         .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT, .pfnUserCallback = validation_message};
+    uint32_t extension_count = 0;
+    const char *const *sdl_extensions = window ? SDL_Vulkan_GetInstanceExtensions(&extension_count) : NULL;
+    if (window && !sdl_extensions) { fprintf(stderr, "gs: SDL Vulkan extensions: %s\n", SDL_GetError()); exit(1); }
+    const char *extensions[32];
+    if (extension_count >= 32) abort();
+    for (unsigned i = 0; i < extension_count; i++) extensions[i] = sdl_extensions[i];
+    if (getenv("DHD_VK_VALIDATE")) extensions[extension_count++] = extension;
+    instance.enabledExtensionCount = extension_count; instance.ppEnabledExtensionNames = extensions;
     if (getenv("DHD_VK_VALIDATE")) {
         instance.enabledLayerCount = 1; instance.ppEnabledLayerNames = &layer;
-        instance.enabledExtensionCount = 1; instance.ppEnabledExtensionNames = &extension; instance.pNext = &debug;
+        instance.pNext = &debug;
     }
     /* Explicit layer request fails if absent: validation runs cannot silently skip it. */
     VK_CALL(vkCreateInstance(&instance, NULL, &v->instance));
@@ -547,11 +706,14 @@ int gs_vulkan_native(Gs *g)
         VK_CALL(create(v->instance, &debug, NULL, &v->debug));
         fprintf(stderr, "gs native Vulkan: Khronos validation enabled\n");
     }
+    if (window && !SDL_Vulkan_CreateSurface(window, v->instance, NULL, &v->surface)) {
+        fprintf(stderr, "gs: SDL Vulkan surface: %s\n", SDL_GetError()); exit(1);
+    }
     uint32_t count = 0; VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, NULL));
     VkPhysicalDevice *devices = calloc(count, sizeof *devices); if (!devices) abort();
     VK_CALL(vkEnumeratePhysicalDevices(v->instance, &count, devices));
     unsigned family = 0;
-    for (unsigned j = 0; j < count; j++) if (native_device_supported(devices[j], &family)) { v->physical = devices[j]; break; }
+    for (unsigned j = 0; j < count; j++) if (native_device_supported(devices[j], v->surface, &family)) { v->physical = devices[j]; break; }
     free(devices);
     if (!v->physical) {
         fprintf(stderr, "gs native Vulkan: requires Vulkan 1.2 graphics/compute, dualSrcBlend, depthClamp, RGBA8 and sampled D32\n");
@@ -561,12 +723,15 @@ int gs_vulkan_native(Gs *g)
         }
         vkDestroyInstance(v->instance, NULL); free(v); native_destroy(n); return 0;
     }
+    v->family = family;
     float priority = 1;
     VkDeviceQueueCreateInfo queue = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
     VkPhysicalDeviceFeatures features = {.dualSrcBlend = VK_TRUE, .depthClamp = VK_TRUE};
     VkDeviceCreateInfo device = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue, .pEnabledFeatures = &features};
+    const char *swapchain_extension = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    if (v->surface) { device.enabledExtensionCount = 1; device.ppEnabledExtensionNames = &swapchain_extension; }
     VK_CALL(vkCreateDevice(v->physical, &device, NULL, &v->device)); vkGetDeviceQueue(v->device, family, 0, &v->queue);
     VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(v->physical, &properties);
     v->alignment = properties.limits.minUniformBufferOffsetAlignment;
@@ -630,15 +795,23 @@ int gs_vulkan_native(Gs *g)
     v->arena = buffer_create(v, 64u*1024*1024, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     v->inverse = buffer_create(v, 4096*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); native_page_inverse(v->inverse.map);
     image_create(v, &v->dummy, 1, 1, 0); image_create(v, &v->dummy_depth, 1, 1, 1); submit(v);
+    if (v->surface) {
+        VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VK_CALL(vkCreateSemaphore(v->device, &sem, NULL, &v->acquired));
+        int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); native_vulkan_window_size(n, w, h);
+    }
     native_present_options(n); native_start(g, n, (NativeHost *)g->backend);
     fprintf(stderr, "gs: Vulkan native offscreen renderer: %s\n", properties.deviceName); return 1;
 }
+int gs_vulkan_native(Gs *g) { return gs_vulkan_native_window(g, NULL); }
+
 void native_vulkan_destroy(Native *n)
 {
     NativeVk *v = n->gpu;
     EnterCriticalSection(&n->queue_lock); n->quit = 1; WakeAllConditionVariable(&n->queue_changed); LeaveCriticalSection(&n->queue_lock);
     if (n->thread) { WaitForSingleObject(n->thread, INFINITE); CloseHandle(n->thread); n->thread = NULL; }
-    submit(v); retire(v);
+    submit(v); retire(v); swapchain_free(v);
+    if (v->acquired) vkDestroySemaphore(v->device, v->acquired, NULL);
     for (unsigned j = 0; j < NATIVE_TEXTURES; j++) native_gpu_texture_free(n, &n->textures[j]);
     retire(v);
     for (unsigned j = 0; j < NATIVE_SURFACES; j++) image_free(v, &v->surfaces[j]);
@@ -656,6 +829,7 @@ void native_vulkan_destroy(Native *n)
         PFN_vkDestroyDebugUtilsMessengerEXT destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkDestroyDebugUtilsMessengerEXT");
         destroy(v->instance, v->debug, NULL);
     }
+    if (v->surface) vkDestroySurfaceKHR(v->instance, v->surface, NULL);
     vkDestroyInstance(v->instance, NULL);
     free(v); n->gpu = NULL; n->host->native = NULL;
     pthread_cond_destroy(&n->queue_changed);

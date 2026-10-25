@@ -35,11 +35,13 @@ def build(out, tree, vulkan=False, source='test_native_replay.c'):
         sources = [ROOT / "port/gs" / source,
                    *[tree / "port/gs" / name for name in ("native.c", "gs.c", "memory.c")],
                    *[tree / "port/platform/linux" / name for name in ("gpu.c", "native_gpu.c", "win32.c")]]
+        import sdl3
+        sdl_lib, sdl_include = sdl3.build()
         exe = out / "test-native-vulkan"
         subprocess.run(["clang", "-m32", "-O2", "-msse2", "-ffp-contract=off",
-                        "-DDHD_NATIVE_VULKAN", "-I", str(out), "-I", str(tree / "port/include"),
+                        "-DDHD_NATIVE_VULKAN", "-I", str(sdl_include), "-I", str(out), "-I", str(tree / "port/include"),
                         "-I", str(tree / "port/platform/linux/include"),
-                        *map(str, sources), "-o", str(exe), "-lvulkan", "-lm", "-lpthread"], check=True)
+                        *map(str, sources), "-o", str(exe), "-lvulkan", str(sdl_lib), *sdl3.LINUX_SYSTEM_LIBS], check=True)
         return exe
     shader = (tree / 'port/gs/raster.hlsl').read_text()
     (out / 'gs_shader.h').write_text(

@@ -199,7 +199,7 @@ def runtime():
         o = os.path.join(OUT, name + '.o')
         os.makedirs(os.path.dirname(o), exist_ok=True)
         extra = ['-DPS2_VU_AOT'] if aot and name == 'runtime/vu0_interp.c' else []
-        if name == 'hle/gamepad.c' or (LINUX and name == 'gs/present.c'):
+        if name == 'hle/gamepad.c' or (LINUX and name in ('gs/present.c', 'platform/linux/native_gpu.c')):
             extra = ['-I', str(sdl3.build()[1])]
         if LINUX:
             if name == 'gs/gpu.c':
