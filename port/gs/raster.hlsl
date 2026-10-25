@@ -564,7 +564,16 @@ float4 native_replacement(float2 uv, float2 across, float2 down) {
 // Targets keep the whole GS alpha (0..255 as a fraction of 255, so a texture drawn with alpha 0xFF
 // still reads 0xFF: the rider shadow); the blender takes As / 128 from the second output
 // (dual-source blending, SRC1_ALPHA).
-struct NativeOutput { float4 color : SV_Target0; float4 blend : SV_Target1; };
+struct NativeOutput {
+#ifdef __spirv__
+    [[vk::location(0), vk::index(0)]]
+#endif
+    float4 color : SV_Target0;
+#ifdef __spirv__
+    [[vk::location(0), vk::index(1)]]
+#endif
+    float4 blend : SV_Target1;
+};
 NativeOutput native_pixel(NativeVaryings i) {
     float4 color = i.color;
     float q = abs(i.stqf.z) > 1e-30 ? i.stqf.z : 1e-30;
