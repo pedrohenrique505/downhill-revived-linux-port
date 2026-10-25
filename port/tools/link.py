@@ -21,7 +21,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data, recomp, sdl3  # noqa: E402
-from pctarget import HOST_TARGET, IMAGE_BASE, LABEL_PREFIX as P, TARGET  # noqa: E402
+from pctarget import HOST_TARGET, IMAGE_BASE, LABEL_PREFIX as P, PLATFORM, TARGET  # noqa: E402
+
+LINUX = PLATFORM == 'linux'
+# Linux (port/platform/linux): these host files have a POSIX version there; the Win32 calls of the
+# others come from its <windows.h>, included before them with the MSVC C runtime's names.
+LINUX_FILES = {'runtime/memory.c': 'platform/linux/memory.c', 'runtime/fp_trap.c': 'platform/linux/fp_trap.c',
+               'hle/host.c': 'platform/linux/host.c', 'gs/present.c': 'platform/linux/present.c'}
+# Not on Linux yet: Direct3D 11 (the native renderer, texture packs, the sharp font) and WinHTTP
+# (online, the updater). platform/linux/not_yet.c has inert versions of what the rest calls.
+LINUX_LATER = {'gs/gpu.c', 'gs/texpack.c', 'gs/font_sharp.c', 'hle/update.c', 'hle/splash.c', 'net/ws_winhttp.c'}
+LINUX_INCLUDE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'platform', 'linux', 'include')
+# The game's code keeps the stack only 4-aligned, as on Windows (pctarget.py): host functions it
+# calls realign theirs (-mstackrealign) before using 16-byte SSE spills.
+LINUX_STACK = ['-mstackrealign'] if LINUX else []
+LINUX_CFLAGS = LINUX_STACK + ['-D_GNU_SOURCE', '-D_FILE_OFFSET_BITS=64', '-fdeclspec', '-I', LINUX_INCLUDE, '-include', os.path.join(LINUX_INCLUDE, 'msvc_compat.h')] if LINUX else []
+EXE = 'dhd' if LINUX else 'dhd.exe'
 
 ROOT = data.ROOT
 OBJ = os.path.join(ROOT, 'build', 'port', 'obj')
@@ -171,15 +186,22 @@ def runtime():
                  # online races (port/net, finding 042)
                  'net/lockstep.c', 'net/hash.c', 'net/json.c', 'net/client.c', 'net/ws_winhttp.c', 'net/net.c',
                  # the keyboard and the controllers through SDL3 (finding 059)
-                 'hle/keyboard.c', 'hle/text_input.c', 'hle/gamepad.c'):
+                 'hle/keyboard.c', 'hle/text_input.c', 'hle/gamepad.c') + (('platform/linux/win32.c', 'platform/linux/not_yet.c') if LINUX else ()):
+        if LINUX and name in LINUX_LATER:
+            continue
+        source = LINUX_FILES.get(name, name) if LINUX else name
         o = os.path.join(OUT, name + '.o')
         os.makedirs(os.path.dirname(o), exist_ok=True)
         extra = ['-DPS2_VU_AOT'] if aot and name == 'runtime/vu0_interp.c' else []
-        if name == 'hle/gamepad.c':
+        if name == 'hle/gamepad.c' or (LINUX and name == 'gs/present.c'):
             extra = ['-I', str(sdl3.build()[1])]
+        if LINUX:
+            extra += LINUX_CFLAGS + ['-I', os.path.join(ROOT, 'port', 'hle'), '-I', os.path.join(ROOT, 'port', 'gs')]
+            if name == 'hle/sound.c':
+                extra.append('-DSND_NO_HOST')  # the mixer without Windows' WASAPI output (no sound yet)
         p = run(['clang', '--target=' + HOST_TARGET, '-c', '-O2', '-msse2', '-mfpmath=sse',
                  '-ffp-contract=off', '-w', '-I', OUT, '-I', os.path.join(ROOT, 'port', 'runtime'),
-                 os.path.join(ROOT, 'port', name), '-o', o] + extra)
+                 os.path.join(ROOT, 'port', source), '-o', o] + extra)
         if p.returncode:
             sys.exit(p.stderr)
         out.append(o)
@@ -199,7 +221,7 @@ def runtime():
 
 HOST_CFLAGS = ['--target=' + HOST_TARGET, '-c', '-O1', '-w', '-fno-strict-aliasing', '-fwrapv', '-msse2',
                '-mfpmath=sse', '-ffp-contract=off', '-I', os.path.join(ROOT, 'port', 'runtime'),
-               '-I', os.path.join(ROOT, 'port', 'include')]
+               '-I', os.path.join(ROOT, 'port', 'include')] + LINUX_STACK
 
 
 RECOMP_FAILED = {}  # {SDK function: why the recompiler couldn't translate it}
@@ -272,19 +294,35 @@ def main():
         fixups_s, nfix = data.write_fixups(image_obj, fixups, image_nm)
     except (OSError, ValueError) as e:
         sys.exit('PS2 data image: %s' % e)
-    # the icon (port/res/dhd.rc), shown by Explorer, the taskbar and the game's windows
-    res = os.path.join(OUT, 'dhd.res')
-    p = run(['llvm-rc', '/fo', res, os.path.join(ROOT, 'port', 'res', 'dhd.rc')])
-    if p.returncode:
-        sys.exit(p.stderr)
-    dobjs = [symbols_obj, assemble(fixups_s), res]
-    # SDL3, static (port/tools/sdl3.py), and the Windows libraries it needs: in the object list,
-    # so build_clean.py's relink gets them too
-    libs = [str(sdl3.build()[0])] + ['-Wl,' + name for name in sdl3.SYSTEM_LIBS]
+    dobjs = [symbols_obj, assemble(fixups_s)]
+    libs = []
+    if LINUX:
+        dobjs.append(os.path.join(data.OUT, 'aliases.ld'))  # the image's aliases (data.py)
+        # SDL3, static (port/tools/sdl3.py): window, renderer, keyboard, controllers, sound
+        libs = [str(sdl3.build()[0])] + sdl3.LINUX_SYSTEM_LIBS
+    if not LINUX:
+        # the icon (port/res/dhd.rc), shown by Explorer, the taskbar and the game's windows
+        res = os.path.join(OUT, 'dhd.res')
+        p = run(['llvm-rc', '/fo', res, os.path.join(ROOT, 'port', 'res', 'dhd.rc')])
+        if p.returncode:
+            sys.exit(p.stderr)
+        dobjs.append(res)
+        # SDL3, static (port/tools/sdl3.py), and the Windows libraries it needs: in the object list,
+        # so build_clean.py's relink gets them too
+        libs = [str(sdl3.build()[0])] + ['-Wl,' + name for name in sdl3.SYSTEM_LIBS]
     rsp = os.path.join(OUT, 'objs.rsp')
     with open(rsp, 'w', newline='\n') as f:
         f.write(''.join(o.replace(os.sep, '/') + '\n' for o in objs + dobjs + libs))
     def link(extra=()):
+        if LINUX:
+            # Fixed at IMAGE_BASE above the PS2 RAM views (port/platform/linux/memory.c, which also
+            # makes .rodata writable: the PS2 never protected it). Unresolved symbols and duplicates
+            # are let through as on Windows (/force), for the census and missing.c below.
+            return run(['clang', '--target=' + HOST_TARGET, '-fuse-ld=lld', '-no-pie', '-o', os.path.join(OUT, EXE),
+                        '@' + rsp, *extra, '-Wl,--image-base=0x%X' % IMAGE_BASE, '-Wl,-Map=' + os.path.join(OUT, 'dhd.map'),
+                        '-Wl,--warn-unresolved-symbols', '-Wl,-z,muldefs', '-Wl,--error-limit=0',
+                        '-Wl,--no-dependent-libraries',  # MSVC's #pragma comment(lib) (online.c: bcrypt)
+                        '-lpthread', '-lm', '-ldl', '-latomic'])  # 64-bit atomics on i386
         return run(['clang', '--target=' + HOST_TARGET, '-fuse-ld=lld', '-o', os.path.join(OUT, 'dhd.exe'),
                     '@' + rsp, '-Wl,d3dcompiler.lib', '-Wl,d3d11.lib', '-Wl,dxgi.lib', '-Wl,user32.lib', '-Wl,gdi32.lib', '-Wl,winhttp.lib', '-Wl,ole32.lib', *extra, '-Wl,/map:' + os.path.join(OUT, 'dhd.map'), '-Wl,/subsystem:windows', '-Wl,/entry:mainCRTStartup', '-Wl,/safeseh:no', '-Wl,/demangle:no',
                     '-Wl,/force', '-Wl,/errorlimit:0',
@@ -335,7 +373,7 @@ def main():
         if p.returncode:
             sys.exit(p.stderr)
         left = sorted(set(re.findall(r'undefined symbol: (.+)', p.stderr)))
-        print('dhd.exe linked with %d stubs; still undefined: %s' % (len(stubs), ', '.join(left) or 'none'))
+        print('%s linked with %d stubs; still undefined: %s' % (EXE, len(stubs), ', '.join(left) or 'none'))
 
 
 if __name__ == '__main__':

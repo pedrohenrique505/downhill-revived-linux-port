@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pctarget import HOST_TARGET  # noqa: E402
+from pctarget import HOST_TARGET, PLATFORM  # noqa: E402
 
 VERSION = '3.4.18'
 URL = 'https://github.com/libsdl-org/SDL/releases/download/release-%s/SDL3-%s.tar.gz' % (VERSION, VERSION)
@@ -51,6 +51,21 @@ OPTIONS = dict(SDL_SHARED='OFF', SDL_STATIC='ON', SDL_TEST_LIBRARY='OFF', SDL_TE
                # brings a table of doubles in which package_release.py's path check reads
                # "Y:/(A6>" (SDL's dynamic API table references every SDL function, SDL_atan too)
                LIBC_HAS_ATAN='0', LIBC_HAS_ATANF='0', LIBC_HAS_ATAN2='0', LIBC_HAS_ATAN2F='0')
+
+
+# Linux (port/platform/linux): SDL is also the window, the picture's presentation (its renderer),
+# the keyboard and the sound output. X11, Wayland, PipeWire, PulseAudio and ALSA are loaded when the
+# game starts (SDL's dynamic loading), so the build needs only their headers.
+LINUX_OPTIONS = dict(SDL_SHARED='OFF', SDL_STATIC='ON', SDL_TEST_LIBRARY='OFF', SDL_TESTS='OFF', SDL_EXAMPLES='OFF',
+                     SDL_INSTALL='OFF', SDL_AUDIO='ON', SDL_VIDEO='ON', SDL_GPU='OFF', SDL_RENDER='ON',
+                     SDL_CAMERA='OFF', SDL_POWER='OFF', SDL_SENSOR='OFF', SDL_DIALOG='ON', SDL_TRAY='OFF',
+                     SDL_HAPTIC='ON', SDL_JOYSTICK='ON', SDL_HIDAPI='ON', SDL_HIDAPI_JOYSTICK='ON',
+                     SDL_VIRTUAL_JOYSTICK='OFF', SDL_LIBC='ON', SDL_DISABLE_INSTALL='ON', SDL_DISABLE_UNINSTALL='ON',
+                     SDL_X11_SHARED='ON', SDL_WAYLAND_SHARED='ON', SDL_PIPEWIRE_SHARED='ON', SDL_PULSEAUDIO_SHARED='ON',
+                     SDL_ALSA_SHARED='ON', SDL_JACK='OFF', SDL_SNDIO='OFF', SDL_KMSDRM='OFF', SDL_VULKAN='ON',
+                     SDL_OPENGL='ON', SDL_OPENGLES='ON')
+if PLATFORM == 'linux':
+    OPTIONS = LINUX_OPTIONS
 
 
 def sha256(path):
@@ -88,7 +103,7 @@ def tool(name, default=None):
 
 def build():
     """The static library and its include directory; built once per version."""
-    lib = OUT / VERSION / 'build' / 'SDL3-static.lib'
+    lib = OUT / VERSION / 'build' / ('libSDL3.a' if PLATFORM == 'linux' else 'SDL3-static.lib')
     include = OUT / VERSION / 'src' / ('SDL3-%s' % VERSION) / 'include'
     stamp = OUT / VERSION / 'built.txt'
     recipe = repr(sorted(OPTIONS.items())) + HOST_TARGET
@@ -109,14 +124,18 @@ def build():
     cmake = tool('cmake', CMAKE_DEFAULT)
     clang = tool('clang')
     cmd = [cmake, '-S', str(src), '-B', str(bld), '-G', 'Ninja',
-           '-DCMAKE_MAKE_PROGRAM=' + os.path.join(ninja.BIN_DIR, 'ninja.exe'),
+           '-DCMAKE_MAKE_PROGRAM=' + os.path.join(ninja.BIN_DIR, 'ninja' if PLATFORM == 'linux' else 'ninja.exe'),
            '-DCMAKE_C_COMPILER=' + clang, '-DCMAKE_C_COMPILER_TARGET=' + HOST_TARGET,
            '-DCMAKE_CXX_COMPILER=' + clang.replace('clang', 'clang++'), '-DCMAKE_CXX_COMPILER_TARGET=' + HOST_TARGET,
            '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
            '-DCMAKE_C_FLAGS=-msse2', '-DCMAKE_POLICY_DEFAULT_CMP0091=NEW']
     cmd += ['-D%s=%s' % kv for kv in sorted(OPTIONS.items())]
+    env = dict(os.environ)
+    if PLATFORM == 'linux':
+        # the 32-bit libraries' pkg-config files (lib32-* packages); the headers are shared
+        env['PKG_CONFIG_LIBDIR'] = '/usr/lib32/pkgconfig:/usr/share/pkgconfig'
     for step in (cmd, [cmake, '--build', str(bld)]):
-        p = subprocess.run(step, capture_output=True, text=True)
+        p = subprocess.run(step, capture_output=True, text=True, env=env)
         if p.returncode:
             sys.exit('SDL3 build failed:\n' + (p.stdout + p.stderr)[-4000:])
     if not lib.exists():
@@ -125,7 +144,8 @@ def build():
     return lib, include
 
 
-# The Windows libraries the static SDL3 needs at link time.
+# The system libraries the static SDL3 needs at link time.
+LINUX_SYSTEM_LIBS = ['-lm', '-ldl', '-lpthread', '-lrt']
 SYSTEM_LIBS = ['setupapi.lib', 'winmm.lib', 'imm32.lib', 'version.lib', 'ole32.lib', 'oleaut32.lib',
                'advapi32.lib', 'shell32.lib', 'user32.lib', 'gdi32.lib', 'cfgmgr32.lib', 'uuid.lib']
 
