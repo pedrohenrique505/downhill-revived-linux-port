@@ -305,8 +305,14 @@ void draw_pixel(uint2 xy, Primitive d) {
         weight = float3(e0,e1,e2) / (float)area;
     }
     int4 color = rgba(d.position[last].w);
-    if ((prim & 8) && type != 6)
-        color = (int4)(rgba(d.position[0].w) * weight.x + rgba(d.position[1].w) * weight.y + rgba(d.position[2].w) * weight.z);
+    if ((prim & 8) && type != 6) {
+        // Interpolate differences from one vertex, preserving constant channels.
+        // Summing three weighted copies can turn alpha 128 into 127.99999;
+        // truncation then changes a subsequent texture alpha test.
+        int4 base = rgba(d.position[0].w);
+        color = (int4)(base + (rgba(d.position[1].w) - base) * weight.y +
+                             (rgba(d.position[2].w) - base) * weight.z);
+    }
     uint z = d.position[last].z;
     bool constant_z = d.position[0].z == d.position[1].z && (d.info.z < 3 || d.position[0].z == d.position[2].z);
     if (type != 0 && type != 6 && !constant_z) {

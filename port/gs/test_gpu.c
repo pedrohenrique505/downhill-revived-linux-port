@@ -401,6 +401,30 @@ static void deferred_read_waits(void)
     CHECK(color[60] == (3999 & 255) && color[63] == 0x80);
 }
 
+/* A constant Gouraud channel stays constant across a triangle. Losing one
+   alpha unit before MODULATE can discard a visible texel at ATST GREATER. */
+static void gouraud_alpha_threshold(void)
+{
+    gs_write(&gs, GS_FRAME_1, 1u << 16);
+    gs_write(&gs, GS_SCISSOR_1, UINT64_C(63) << 16 | UINT64_C(63) << 48);
+    gs_write(&gs, GS_XYOFFSET_1, 0);
+    gs_write(&gs, GS_ZBUF_1, UINT64_C(1) << 32);
+    gs_write(&gs, GS_TEST_1, 0);
+    sprite(0, 0x80112233, 0,0,32,32,0);
+    gs_write_pixel(&gs, 0,1024,1,0,0,0x41808080);
+    gs_write(&gs, GS_TEX0_1, 1024 | 1u << 14 | UINT64_C(1) << 34);
+    gs_write(&gs, GS_TEX1_1, 0); gs_write(&gs, GS_CLAMP_1, 5);
+    gs_write(&gs, GS_TEST_1, 1 | 6u << 1 | 64u << 4);
+    gs_write(&gs, GS_PRIM, 3 | 8 | 16 | 256);
+    gs_write(&gs, GS_RGBAQ, UINT64_C(0x3F80000080808080));
+    gs_write(&gs, GS_UV, 0);
+    gs_write(&gs, GS_XYZ2, 0);
+    gs_write(&gs, GS_XYZ2, 496 | UINT64_C(1) << 16);
+    gs_write(&gs, GS_XYZ2, 2 | UINT64_C(512) << 16);
+    gs.sync(&gs);
+    CHECK(at(16,1) == 0x41808080);
+}
+
 int main(void)
 {
 #ifndef __linux__
@@ -570,6 +594,7 @@ int main(void)
     local_copies();
     deferred_reads();
     deferred_read_waits();
+    gouraud_alpha_threshold();
 #ifdef __linux__
     queued_states();
     aliased_states();
