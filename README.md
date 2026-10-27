@@ -25,8 +25,9 @@ updates.
 
 What works today:
 
-- **Native renderer** (Direct3D 11). The original PS2 graphics hardware is reproduced on the
-  GPU. An exact emulation path stays in the code as the reference it is tested against.
+- **Native renderer** (Direct3D 11 on Windows, Vulkan on Linux). The original PS2 graphics
+  hardware is reproduced on the GPU. An exact emulation path stays in the code as the reference
+  it is tested against. [Linux build and measured limits](docs/BUILDING.md#linux-renderers-i686).
 - **60 fps with even frame pacing.** The game runs at its original 59.94 Hz, and each picture is
   shown on a fixed 59.94 Hz grid, so frames don't come out long-short-long. Pad input is read as
   late as possible before each frame.

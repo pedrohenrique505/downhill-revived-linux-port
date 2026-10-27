@@ -252,12 +252,14 @@ build's. The executable runs under Wine; for `DHD_RENDER=native` the prefix need
 [DXVK](https://github.com/doitsujin/dxvk) and Microsoft's 32-bit `d3dcompiler_47.dll`. The race
 gates and `port/tools/test_native_paths.py` start a `.exe` through `wine`.
 
-## Linux exact renderer (i686)
+## Linux renderers (i686)
 
-The Linux port uses Vulkan 1.2 compute for `DHD_RENDER=exact`, with the shared
-`port/gs/raster.hlsl` shader and SDL3 Vulkan presentation. The device must support
-`shaderFloat64` and `shaderSignedZeroInfNanPreserveFloat32`. The native/upscaled
-D3D11 backend, texture packs and updater have not been ported to Linux.
+The Linux port provides `DHD_RENDER=native` (scaled hardware rendering and an
+SDL Vulkan swapchain) and `DHD_RENDER=exact` (the compute reference with SDL3
+presentation). Both use the shared `port/gs/raster.hlsl` shader. The device must
+support Vulkan 1.2, `shaderFloat64` and `shaderSignedZeroInfNanPreserveFloat32`;
+native also requires graphics/presentation, dual-source blending and depth clamp.
+Texture packs, sharp fonts and the updater are still unavailable on Linux.
 
 In addition to the extracted executable/build prerequisites, install clang/lld,
 LLVM tools, a 32-bit C development environment, Vulkan headers and **both the
@@ -278,7 +280,7 @@ with a warning.
 python port/tools/build.py
 python port/tools/link.py
 DHD_ISO='/path/to/your/Downhill Domination (USA).iso' \
-  DHD_RENDER=exact DHD_SKIP_MOVIES=1 ./build/port/link/dhd
+  DHD_RENDER=native DHD_SKIP_MOVIES=1 ./build/port/link/dhd
 ```
 
 Run the applicable GS memory and shared raster fixtures with:
@@ -294,3 +296,40 @@ as on D3D11. Scanout synchronizes VRAM before SDL uploads the display picture
 (findings 077-079). These choices prioritize correctness;
 Vulkan support alone does not imply real-time performance. See finding 076 for
 validation results and outstanding acceptance work.
+
+Native presentation runs on its own thread. `renderer = native` in `dhd.ini`
+selects it; Linux's existing default remains `exact`. `DHD_SCALE=1` through `4`
+(or `window`), `DHD_WIDESCREEN=1`, `DHD_ASPECT` and `DHD_PRESENT_FILTER=point`
+use the shared native renderer settings. Movies keep their 4:3 shape. The SDL
+window supports resize, borderless/fullscreen and normal close events.
+
+`DHD_INTERP=1` interpolates pictures on the render thread while the game continues
+its ordinary simulation. It follows display vsync by default; add
+`DHD_INTERP_HZ=120` or `144` to pace pictures with a timer instead. This setting
+is separate from the game's `DHD_FPS` simulation rate.
+
+`DHD_SCREENSHOT=picture.bmp DHD_CAPTURE_FRAME=4000` saves the completed native
+picture at its rendering resolution. Field/race capture schedules also work.
+`DHD_BENCH=6000-6600 DHD_TIMELINE=1` reports field/picture rates, thread CPU time
+and graphics waits; a CSV path instead of `1` saves per-field timeline rows.
+`DHD_DUMP=15` prints an EE/kernel snapshot after 15 wall seconds, at the next
+safe kernel boundary.
+
+Native regression checks (a desktop session and an i686 Vulkan driver are needed;
+`--validation` additionally requires the i686 Khronos validation layer):
+
+```sh
+python port/tools/test_native_window.py --validation
+python port/tools/test_native_transfers.py --vulkan --validation
+DHD_ISO='/path/to/your/Downhill Domination (USA).iso' \
+  python port/tools/test_native_race_linux.py --out build/port/native-race --hz 144
+```
+
+The race driver uses X11/Xwayland and `xdotool` for its own window, reads only its
+child's `/proc/PID/mem`, applies public pad input and waits for the real finish
+flag before closing. `--ticks N` is only a bounded smoke test. See
+[finding 084](findings/084-linux-native-presentation.md) for measured results and
+validation evidence. On the measured RADV RENOIR host at scale 2, the two-bank
+renderer presents 144 pictures/s while the game advances about 50 fields/s in the
+benchmark scene. Sustained 60 game fields/s remains performance work; selecting
+an interpolation rate does not guarantee simulation throughput.

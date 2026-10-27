@@ -2041,3 +2041,18 @@ the other two fields each differ in two pixels by one channel unit (RGB MAE
 7.26609e-7), all FIFO transcripts match. Existing exact GS/capture/GPU tests and
 portable-frontend check pass; exact compute binaries remain byte-identical.
 Evidence: build/port/issue15/. Matching sources/checks unchanged; no game data committed.
+
+
+Linux native presentation (2026-10-27, finding 084, fork issue #16): native selection now
+installs the portable frontend before game packets and presents scaled surfaces/movies through
+an SDL Vulkan swapchain on the existing render thread. Resize, aspect/filter/player-quarter
+options, monitor-vsync and DHD_INTERP_HZ, native screenshots, DHD_DUMP, DHD_BENCH and DHD_TIMELINE
+are connected. Context-request publication fixes Linux mutex starvation. Two fenced native
+resource banks overlap CPU/GPU work; reads, resize and destruction drain both. Four synthetic
+window modes, 17 transfer/backend fixtures and 23 captures/86 pictures pass API/synchronization
+validation, with previous RGBA hashes/readbacks unchanged. Full 120/144 runs finish at official
+tick 23551 and close normally; the final two-bank 144-Hz full race also finishes at that tick,
+includes the results transition and exits with code 0. The two-bank 144-Hz
+benchmark reaches 144.01 pictures/s and 49.864 game fields/s at scale 2 on RADV RENOIR: sustained
+60-field game throughput remains open. Matching sources/checks unchanged; artifacts remain in
+build/port/issue16/.

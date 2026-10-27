@@ -1,6 +1,7 @@
 # Linux native window and interpolation (fork issue #16)
 
-2026-10-25. Implementation in progress. Matching sources/checks unchanged.
+2026-10-25–27. Window implementation and functional validation complete. Sustained
+60-field game throughput remains open on the measured host. Matching sources/checks unchanged.
 
 ## Sources
 
@@ -154,3 +155,30 @@ Thus presentation reaches its target, but 60 game fields/s is not sustained in
 this measured scene on this RADV RENOIR host. No checker or tolerance changed.
 Evidence: `resume144-banks/result.json`. A final full race on the two-bank
 backend is pending below.
+
+
+## Final two-bank full race (2026-10-27)
+
+The final executable completes the full 144-Hz race at official tick **23551**
+(392.5167 game seconds), exactly the same finish tick as normal and 120-Hz runs.
+Two resizes, three scaled screenshots, DHD_DUMP, benchmark and timeline succeed.
+After 600 further fields covering the normal finish/results transition, the
+harness sends WM_DELETE_WINDOW and the application exits with code 0.
+Wall duration including boot/loading: 548.386 s; 27367 recorded fields and
+78379 presented pictures. Corrected post-benchmark exit rate: 143.01 pictures/s.
+The unchanged benchmark at fields 6000-6600 reports **144.01 pictures/s**,
+1695 interpolated pictures, **49.864 game fields/s**. Timing runs have validation
+off; the separate synthetic window/transfer and recorded-field regressions have
+API and synchronization validation on, with no warnings/errors.
+Evidence: `build/port/issue16/resume144-full/result.json`, `run.log` and captures.
+
+Functional issue-16 scope is implemented: scaled SDL Vulkan scanout/presentation,
+movies, shape/filter settings, resize/close, render-thread ownership, vsync and
+timed interpolation, readback/screenshots and diagnostics. All 86 reference
+pictures/readbacks remain unchanged after the two-bank change. Sustained
+60-field simulation in the measured heavy scene is **not** an achieved
+performance result; it remains explicit follow-up work. No pixels, readbacks,
+reference data or matching checks were excluded or weakened.
+
+The tested executable is copied to `build/port/run/dhd`; it has the same SHA-256
+as `build/port/link/dhd`. No game-derived artifacts are committed.
