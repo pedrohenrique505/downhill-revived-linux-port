@@ -26,13 +26,26 @@ typedef struct NativeImage Image;
 typedef struct { VkBuffer buffer; VkDeviceMemory memory; void *map; VkDeviceSize size; } NativeBuffer;
 typedef struct Garbage { struct Garbage *next; Image image; VkFramebuffer framebuffer; } Garbage;
 typedef struct Pipeline { struct Pipeline *next; uint32_t blend; unsigned depth, mask, kind; VkPipeline pipeline; } Pipeline;
+/* Each picture owns its upload/descriptor/command storage until its fence.
+   Garbage is tied to the newest submission that can still reference it. */
+typedef struct {
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkFence fence;
+    VkSemaphore acquired;
+    VkDescriptorPool descriptor_pool;
+    NativeBuffer arena;
+    VkDeviceSize used;
+    Garbage *garbage;
+    int recording, pending;
+} NativeBank;
 typedef struct {
     VkInstance instance;
     VkDebugUtilsMessengerEXT debug;
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkImage *backbuffers;
-    VkSemaphore *finished, acquired;
+    VkSemaphore *finished;
     unsigned image_count, family, width, height, requested_width, requested_height;
     unsigned window_width, window_height; /* published by the SDL/window thread */
     VkPresentModeKHR present_mode;
@@ -40,22 +53,18 @@ typedef struct {
     VkPhysicalDevice physical;
     VkDevice device;
     VkQueue queue;
-    VkCommandPool pool;
-    VkCommandBuffer cmd;
-    VkFence fence;
-    int recording, pending;
+    NativeBank banks[2], *active;
+    unsigned bank;
     VkDescriptorSetLayout descriptors;
     VkPipelineLayout layout;
-    VkDescriptorPool descriptor_pool;
     VkRenderPass passes[2];
     VkShaderModule shaders[8];
     VkPipeline scanout, convert;
     VkSampler samplers[8];
     Pipeline *pipelines;
     Image surfaces[NATIVE_SURFACES], converted[NATIVE_CONVERTS], display, dummy, dummy_depth;
-    NativeBuffer arena, inverse, readback;
-    VkDeviceSize used, alignment;
-    Garbage *garbage;
+    NativeBuffer inverse, readback;
+    VkDeviceSize alignment;
 } NativeVk;
 
 static void vk_require(VkResult r, const char *what)
@@ -98,57 +107,64 @@ static void image_free(NativeVk *v, Image *i)
     if (i->memory) vkFreeMemory(v->device, i->memory, NULL);
     free(i->pixels); memset(i, 0, sizeof *i);
 }
-static void retire(NativeVk *v)
+static void retire_bank(NativeVk *v, NativeBank *bank)
 {
-    if (v->pending) {
-        VK_CALL(vkWaitForFences(v->device, 1, &v->fence, VK_TRUE, UINT64_MAX));
-        v->pending = 0;
+    if (bank->pending) {
+        VK_CALL(vkWaitForFences(v->device, 1, &bank->fence, VK_TRUE, UINT64_MAX));
+        bank->pending = 0;
     }
-    while (v->garbage) {
-        Garbage *g = v->garbage; v->garbage = g->next;
+    while (bank->garbage) {
+        Garbage *g = bank->garbage; bank->garbage = g->next;
         image_free(v, &g->image);
         if (g->framebuffer) vkDestroyFramebuffer(v->device, g->framebuffer, NULL);
         free(g);
     }
 }
+static void retire(NativeVk *v)
+{
+    /* Host reads, swapchain changes and teardown drain both banks. */
+    retire_bank(v, &v->banks[0]);
+    retire_bank(v, &v->banks[1]);
+}
 static void begin(NativeVk *v)
 {
-    if (v->recording) return;
-    retire(v);
-    VK_CALL(vkResetCommandPool(v->device, v->pool, 0));
-    VK_CALL(vkResetDescriptorPool(v->device, v->descriptor_pool, 0));
-    v->used = 0;
+    if (v->active->recording) return;
+    v->bank ^= 1; v->active = &v->banks[v->bank];
+    retire_bank(v, v->active);
+    VK_CALL(vkResetCommandPool(v->device, v->active->pool, 0));
+    VK_CALL(vkResetDescriptorPool(v->device, v->active->descriptor_pool, 0));
+    v->active->used = 0;
     VkCommandBufferBeginInfo c = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VK_CALL(vkBeginCommandBuffer(v->cmd, &c)); v->recording = 1;
+    VK_CALL(vkBeginCommandBuffer(v->active->cmd, &c)); v->active->recording = 1;
 }
 static void submit(NativeVk *v)
 {
-    if (!v->recording) return;
-    VK_CALL(vkEndCommandBuffer(v->cmd));
-    VK_CALL(vkResetFences(v->device, 1, &v->fence));
-    VkSubmitInfo s = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &v->cmd};
-    VK_CALL(vkQueueSubmit(v->queue, 1, &s, v->fence)); v->pending = 1; v->recording = 0;
+    if (!v->active->recording) return;
+    VK_CALL(vkEndCommandBuffer(v->active->cmd));
+    VK_CALL(vkResetFences(v->device, 1, &v->active->fence));
+    VkSubmitInfo s = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &v->active->cmd};
+    VK_CALL(vkQueueSubmit(v->queue, 1, &s, v->active->fence)); v->active->pending = 1; v->active->recording = 0;
 }
 static void barrier(NativeVk *v)
 {
     VkMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    vkCmdPipelineBarrier(v->active->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
 }
 static VkDeviceSize upload(NativeVk *v, const void *p, size_t size)
 {
     begin(v);
-    VkDeviceSize at = (v->used + v->alignment - 1) / v->alignment * v->alignment;
-    if (at + size > v->arena.size) { fprintf(stderr, "gs native Vulkan: field upload arena exhausted\n"); exit(1); }
-    memcpy((char *)v->arena.map + at, p, size); v->used = at + size;
+    VkDeviceSize at = (v->active->used + v->alignment - 1) / v->alignment * v->alignment;
+    if (at + size > v->active->arena.size) { fprintf(stderr, "gs native Vulkan: field upload arena exhausted\n"); exit(1); }
+    memcpy((char *)v->active->arena.map + at, p, size); v->active->used = at + size;
     return at;
 }
 static void discard_image(NativeVk *v, Image *i)
 {
     if (!i->image) { free(i->pixels); memset(i, 0, sizeof *i); return; }
     Garbage *g = calloc(1, sizeof *g); if (!g) abort();
-    g->image = *i; g->next = v->garbage; v->garbage = g; memset(i, 0, sizeof *i);
+    g->image = *i; g->next = v->active->garbage; v->active->garbage = g; memset(i, 0, sizeof *i);
 }
 static void image_create(NativeVk *v, Image *i, unsigned w, unsigned h, int depth)
 {
@@ -173,9 +189,9 @@ static void image_create(NativeVk *v, Image *i, unsigned w, unsigned h, int dept
         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = i->image, .subresourceRange = range,
         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-    if (depth) { VkClearDepthStencilValue z = {0, 0}; vkCmdClearDepthStencilImage(v->cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range); }
-    else { VkClearColorValue zero = {0}; vkCmdClearColorImage(v->cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range); }
+    vkCmdPipelineBarrier(v->active->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    if (depth) { VkClearDepthStencilValue z = {0, 0}; vkCmdClearDepthStencilImage(v->active->cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range); }
+    else { VkClearColorValue zero = {0}; vkCmdClearColorImage(v->active->cmd, i->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range); }
     barrier(v);
 }
 static void image_upload(NativeVk *v, Image *i, const uint32_t *pixels, unsigned x, unsigned y, unsigned w, unsigned h)
@@ -184,7 +200,7 @@ static void image_upload(NativeVk *v, Image *i, const uint32_t *pixels, unsigned
     barrier(v);
     VkBufferImageCopy copy = {.bufferOffset = at, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .imageOffset = {(int)x, (int)y, 0}, .imageExtent = {w, h, 1}};
-    vkCmdCopyBufferToImage(v->cmd, v->arena.buffer, i->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy); barrier(v);
+    vkCmdCopyBufferToImage(v->active->cmd, v->active->arena.buffer, i->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy); barrier(v);
 }
 static Image *texture_image(NativeVk *v, NativeTexture *t)
 {
@@ -219,7 +235,7 @@ static void image_copy(NativeVk *v, Image *from, Image *to, int sx, int sy, int 
     VkImageCopy c = {.srcSubresource = {from->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .srcOffset = {sx, sy, 0}, .dstSubresource = {to->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .dstOffset = {x, y, 0}, .extent = {w, h, 1}};
-    vkCmdCopyImage(v->cmd, from->image, VK_IMAGE_LAYOUT_GENERAL, to->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c); barrier(v);
+    vkCmdCopyImage(v->active->cmd, from->image, VK_IMAGE_LAYOUT_GENERAL, to->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c); barrier(v);
 }
 static Image snapshot(NativeVk *v, Image *from)
 {
@@ -254,7 +270,7 @@ static VkDescriptorSet descriptors(NativeVk *v, unsigned constant_binding, const
     VkDeviceSize at = upload(v, constants, size);
     VkDescriptorSet set;
     VkDescriptorSetAllocateInfo a = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = v->descriptor_pool, .descriptorSetCount = 1, .pSetLayouts = &v->descriptors};
+        .descriptorPool = v->active->descriptor_pool, .descriptorSetCount = 1, .pSetLayouts = &v->descriptors};
     VK_CALL(vkAllocateDescriptorSets(v->device, &a, &set));
     VkDescriptorImageInfo ii[21]; VkDescriptorBufferInfo bi[21]; VkWriteDescriptorSet writes[21];
     for (unsigned j = 0; j < 21; j++) {
@@ -263,7 +279,7 @@ static VkDescriptorSet descriptors(NativeVk *v, unsigned constant_binding, const
         ii[j] = (VkDescriptorImageInfo){.imageView = image->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
             .sampler = v->samplers[b == 49 ? sampler : 0]};
         bi[j] = b == 22 ? (VkDescriptorBufferInfo){v->inverse.buffer, 0, v->inverse.size} :
-            (VkDescriptorBufferInfo){v->arena.buffer, at, b == constant_binding ? size : 16};
+            (VkDescriptorBufferInfo){v->active->arena.buffer, at, b == constant_binding ? size : 16};
         writes[j] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = set, .dstBinding = b, .descriptorCount = 1, .descriptorType = type,
             .pImageInfo = &ii[j], .pBufferInfo = &bi[j]};
@@ -347,15 +363,15 @@ static void draw(NativeVk *v, Image *target, Image *depth, VkPipeline pipeline, 
         .width = target->w, .height = target->h, .layers = 1};
     VK_CALL(vkCreateFramebuffer(v->device, &c, NULL, &framebuffer));
     Garbage *g = calloc(1, sizeof *g); if (!g) abort();
-    g->framebuffer = framebuffer; g->next = v->garbage; v->garbage = g;
+    g->framebuffer = framebuffer; g->next = v->active->garbage; v->active->garbage = g;
     VkRenderPassBeginInfo pass = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = c.renderPass,
         .framebuffer = framebuffer, .renderArea = {{0,0},{target->w,target->h}}};
-    vkCmdBeginRenderPass(v->cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->layout, 0, 1, &set, 0, NULL);
-    vkCmdSetViewport(v->cmd, 0, 1, &viewport); vkCmdSetScissor(v->cmd, 0, 1, &rect);
-    float f = fix/128.0f, factors[4] = {f,f,f,f}; vkCmdSetBlendConstants(v->cmd, factors);
-    vkCmdDraw(v->cmd, count, 1, first, 0); vkCmdEndRenderPass(v->cmd); barrier(v);
+    vkCmdBeginRenderPass(v->active->cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(v->active->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(v->active->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdSetViewport(v->active->cmd, 0, 1, &viewport); vkCmdSetScissor(v->active->cmd, 0, 1, &rect);
+    float f = fix/128.0f, factors[4] = {f,f,f,f}; vkCmdSetBlendConstants(v->active->cmd, factors);
+    vkCmdDraw(v->active->cmd, count, 1, first, 0); vkCmdEndRenderPass(v->active->cmd); barrier(v);
 }
 static void native_blit(NativeVk *v, Image *from, unsigned S, int sx, int sy, Image *to, unsigned T,
                         int x, int y, int w, int h, Image *previous)
@@ -385,9 +401,9 @@ static Image *native_run_convert(Native *n, NativeFrame *f, unsigned index)
         constants.tex[3] |= (s ? s->scale : 1) << (j*8);
     }
     VkDescriptorSet set = descriptors(v, 4, &constants, sizeof constants, images, 0);
-    barrier(v); vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->convert);
-    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(v->cmd, (out->w+7)/8, (out->h+7)/8, 1); barrier(v);
+    barrier(v); vkCmdBindPipeline(v->active->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->convert);
+    vkCmdBindDescriptorSets(v->active->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(v->active->cmd, (out->w+7)/8, (out->h+7)/8, 1); barrier(v);
     n->stats.conversions_run++; return out;
 }
 static int min_int(int a, int b) { return a < b ? a : b; }
@@ -396,7 +412,7 @@ void native_gpu_draw(Native *n, NativeFrame *f, const NativeVertex *vertices)
     NativeVk *v = n->gpu; begin(v);
     VkDeviceSize vertex_offset = 0;
     if (f->vertex_count) vertex_offset = upload(v, vertices, (size_t)f->vertex_count*sizeof *vertices);
-    vkCmdBindVertexBuffers(v->cmd, 0, 1, &v->arena.buffer, &vertex_offset);
+    vkCmdBindVertexBuffers(v->active->cmd, 0, 1, &v->active->arena.buffer, &vertex_offset);
     int last_convert = -1; Image *converted = NULL;
     for (unsigned j = 0; j < f->command_count; j++) {
         const NativeCommand *k = &f->commands[j];
@@ -471,9 +487,9 @@ int native_gpu_scanout(Native *n, NativeFrame *f)
     Image *out = display_size(n, d[5], d[6]);
     Image *images[67] = {[21] = &v->surfaces[f->display_surface], [65] = out};
     VkDescriptorSet set = descriptors(v, 1, d, sizeof d, images, 0);
-    barrier(v); vkCmdBindPipeline(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->scanout);
-    vkCmdBindDescriptorSets(v->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(v->cmd, (d[5]+7)/8, (d[6]+7)/8, 1); barrier(v);
+    barrier(v); vkCmdBindPipeline(v->active->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->scanout);
+    vkCmdBindDescriptorSets(v->active->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->layout, 0, 1, &set, 0, NULL);
+    vkCmdDispatch(v->active->cmd, (d[5]+7)/8, (d[6]+7)/8, 1); barrier(v);
     /* Window scanout and presentation share a submission: don't wait for this
        field on the CPU just to enqueue its blit into the acquired image. */
     if (!v->surface) submit(v);
@@ -495,10 +511,10 @@ int native_gpu_read(Native *n, uint32_t *pixels)
     begin(v); barrier(v);
     VkBufferImageCopy c = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
         .imageExtent = {n->display_width,n->display_height,1}};
-    vkCmdCopyImageToBuffer(v->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, v->readback.buffer, 1, &c);
+    vkCmdCopyImageToBuffer(v->active->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, v->readback.buffer, 1, &c);
     VkMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
+    vkCmdPipelineBarrier(v->active->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
     submit(v); retire(v); memcpy(pixels, v->readback.map, size); return 1;
 }
 /* SDL window APIs stay on the EE thread; Vulkan presentation stays on native_thread. */
@@ -595,7 +611,7 @@ int native_gpu_present(Native *n)
     if (!swapchain_create(n)) { submit(v); Sleep(10); return 0; }
     begin(v); /* retires the previous submission before reusing the acquire semaphore */
     uint32_t index;
-    VkResult r = vkAcquireNextImageKHR(v->device, v->swapchain, 100000000, v->acquired, VK_NULL_HANDLE, &index);
+    VkResult r = vkAcquireNextImageKHR(v->device, v->swapchain, 100000000, v->active->acquired, VK_NULL_HANDLE, &index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { v->recreate = 1; submit(v); return 0; }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) { submit(v); return 0; }
     if (r != VK_SUBOPTIMAL_KHR) vk_require(r, "vkAcquireNextImageKHR");
@@ -605,9 +621,9 @@ int native_gpu_present(Native *n)
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = v->backbuffers[index], .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    vkCmdPipelineBarrier(v->active->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
     VkClearColorValue black = {.float32 = {0,0,0,1}};
-    vkCmdClearColorImage(v->cmd, b.image, b.newLayout, &black, 1, &range); barrier(v);
+    vkCmdClearColorImage(v->active->cmd, b.image, b.newLayout, &black, 1, &range); barrier(v);
     float fw, fh; native_viewport(n, v->width, v->height, &fw, &fh);
     int x = (int)floorf((v->width-fw)/2), y = (int)floorf((v->height-fh)/2);
     int sx = 0, sy = 0, sw = v->display.w, sh = v->display.h;
@@ -616,17 +632,17 @@ int native_gpu_present(Native *n)
     VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
         .srcOffsets = {{sx,sy,0},{sx+sw,sy+sh,1}}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
         .dstOffsets = {{x,y,0},{x+(int)fw,y+(int)fh,1}}};
-    vkCmdBlitImage(v->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, b.image, b.newLayout,
+    vkCmdBlitImage(v->active->cmd, v->display.image, VK_IMAGE_LAYOUT_GENERAL, b.image, b.newLayout,
         1, &blit, v->point ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     b.oldLayout = b.newLayout; b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = 0;
-    vkCmdPipelineBarrier(v->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-    VK_CALL(vkEndCommandBuffer(v->cmd)); VK_CALL(vkResetFences(v->device, 1, &v->fence));
+    vkCmdPipelineBarrier(v->active->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VK_CALL(vkEndCommandBuffer(v->active->cmd)); VK_CALL(vkResetFences(v->device, 1, &v->active->fence));
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &v->acquired, .pWaitDstStageMask = &wait, .commandBufferCount = 1,
-        .pCommandBuffers = &v->cmd, .signalSemaphoreCount = 1, .pSignalSemaphores = &v->finished[index]};
-    VK_CALL(vkQueueSubmit(v->queue, 1, &submit_info, v->fence)); v->recording = 0; v->pending = 1;
+        .pWaitSemaphores = &v->active->acquired, .pWaitDstStageMask = &wait, .commandBufferCount = 1,
+        .pCommandBuffers = &v->active->cmd, .signalSemaphoreCount = 1, .pSignalSemaphores = &v->finished[index]};
+    VK_CALL(vkQueueSubmit(v->queue, 1, &submit_info, v->active->fence)); v->active->recording = 0; v->active->pending = 1;
     if (!n->interp) pacing_present(n->present_due, n->present_began);
     VkPresentInfoKHR present = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
         .pWaitSemaphores = &v->finished[index], .swapchainCount = 1, .pSwapchains = &v->swapchain, .pImageIndices = &index};
@@ -684,7 +700,7 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
     if (!g || !g->backend || !g->draw) return 0;
     if (native_of(g)) return 1;
     Native *n = native_create(); if (!n) return 0;
-    NativeVk *v = calloc(1, sizeof *v); if (!v) { native_destroy(n); return 0; } n->gpu = v;
+    NativeVk *v = calloc(1, sizeof *v); if (!v) { native_destroy(n); return 0; } n->gpu = v; v->active = &v->banks[0];
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "Downhill Revived native GS", .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo instance = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
@@ -744,12 +760,16 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
     VkPhysicalDeviceProperties properties; vkGetPhysicalDeviceProperties(v->physical, &properties);
     v->alignment = properties.limits.minUniformBufferOffsetAlignment;
     if (v->alignment < 16) v->alignment = 16;
-    VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
-    VK_CALL(vkCreateCommandPool(v->device, &pool, NULL, &v->pool));
-    VkCommandBufferAllocateInfo command = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = v->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    VK_CALL(vkAllocateCommandBuffers(v->device, &command, &v->cmd));
-    VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VK_CALL(vkCreateFence(v->device, &fence, NULL, &v->fence));
+    for (unsigned j = 0; j < 2; j++) {
+        NativeBank *bank = &v->banks[j];
+        VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
+        VK_CALL(vkCreateCommandPool(v->device, &pool, NULL, &bank->pool));
+        VkCommandBufferAllocateInfo command = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = bank->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VK_CALL(vkAllocateCommandBuffers(v->device, &command, &bank->cmd));
+        VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VK_CALL(vkCreateFence(v->device, &fence, NULL, &bank->fence));
+    }
     VkDescriptorSetLayoutBinding bindings[21];
     for (unsigned j = 0; j < 21; j++) bindings[j] = (VkDescriptorSetLayoutBinding){.binding = descriptor_bindings[j],
         .descriptorType = descriptor_type(descriptor_bindings[j]), .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_ALL};
@@ -764,7 +784,7 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,12*SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2*SETS}, {VK_DESCRIPTOR_TYPE_SAMPLER,2*SETS}};
     VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = SETS, .poolSizeCount = 5, .pPoolSizes = sizes};
-    VK_CALL(vkCreateDescriptorPool(v->device, &dp, NULL, &v->descriptor_pool));
+    for (unsigned j = 0; j < 2; j++) VK_CALL(vkCreateDescriptorPool(v->device, &dp, NULL, &v->banks[j].descriptor_pool));
     for (unsigned z = 0; z < 2; z++) {
         VkAttachmentDescription attachments[2] = {
             {.format = VK_FORMAT_R8G8B8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -800,12 +820,13 @@ int gs_vulkan_native_window(Gs *g, SDL_Window *window)
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE};
         VK_CALL(vkCreateSampler(v->device, &s, NULL, &v->samplers[j]));
     }
-    v->arena = buffer_create(v, 64u*1024*1024, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    for (unsigned j = 0; j < 2; j++)
+        v->banks[j].arena = buffer_create(v, 64u*1024*1024, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     v->inverse = buffer_create(v, 4096*4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); native_page_inverse(v->inverse.map);
     image_create(v, &v->dummy, 1, 1, 0); image_create(v, &v->dummy_depth, 1, 1, 1); submit(v);
     if (v->surface) {
         VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        VK_CALL(vkCreateSemaphore(v->device, &sem, NULL, &v->acquired));
+        for (unsigned j = 0; j < 2; j++) VK_CALL(vkCreateSemaphore(v->device, &sem, NULL, &v->banks[j].acquired));
         int w, h; SDL_GetWindowSizeInPixels(window, &w, &h); native_vulkan_window_size(n, w, h);
     }
     native_present_options(n); native_start(g, n, (NativeHost *)g->backend);
@@ -819,20 +840,26 @@ void native_vulkan_destroy(Native *n)
     EnterCriticalSection(&n->queue_lock); n->quit = 1; WakeAllConditionVariable(&n->queue_changed); LeaveCriticalSection(&n->queue_lock);
     if (n->thread) { WaitForSingleObject(n->thread, INFINITE); CloseHandle(n->thread); n->thread = NULL; }
     submit(v); retire(v); swapchain_free(v);
-    if (v->acquired) vkDestroySemaphore(v->device, v->acquired, NULL);
+    for (unsigned j = 0; j < 2; j++)
+        if (v->banks[j].acquired) vkDestroySemaphore(v->device, v->banks[j].acquired, NULL);
     for (unsigned j = 0; j < NATIVE_TEXTURES; j++) native_gpu_texture_free(n, &n->textures[j]);
     retire(v);
     for (unsigned j = 0; j < NATIVE_SURFACES; j++) image_free(v, &v->surfaces[j]);
     for (unsigned j = 0; j < NATIVE_CONVERTS; j++) image_free(v, &v->converted[j]);
     image_free(v, &v->display); image_free(v, &v->dummy); image_free(v, &v->dummy_depth);
-    buffer_free(v, &v->arena); buffer_free(v, &v->inverse); buffer_free(v, &v->readback);
+    for (unsigned j = 0; j < 2; j++) buffer_free(v, &v->banks[j].arena);
+    buffer_free(v, &v->inverse); buffer_free(v, &v->readback);
     while (v->pipelines) { Pipeline *p = v->pipelines; v->pipelines = p->next; vkDestroyPipeline(v->device, p->pipeline, NULL); free(p); }
     for (unsigned j = 0; j < 8; j++) { vkDestroyShaderModule(v->device, v->shaders[j], NULL); vkDestroySampler(v->device, v->samplers[j], NULL); }
     vkDestroyPipeline(v->device, v->scanout, NULL); vkDestroyPipeline(v->device, v->convert, NULL);
     for (unsigned j = 0; j < 2; j++) vkDestroyRenderPass(v->device, v->passes[j], NULL);
-    vkDestroyDescriptorPool(v->device, v->descriptor_pool, NULL); vkDestroyPipelineLayout(v->device, v->layout, NULL);
-    vkDestroyDescriptorSetLayout(v->device, v->descriptors, NULL); vkDestroyFence(v->device, v->fence, NULL);
-    vkDestroyCommandPool(v->device, v->pool, NULL); vkDestroyDevice(v->device, NULL);
+    for (unsigned j = 0; j < 2; j++) {
+        vkDestroyDescriptorPool(v->device, v->banks[j].descriptor_pool, NULL);
+        vkDestroyFence(v->device, v->banks[j].fence, NULL);
+        vkDestroyCommandPool(v->device, v->banks[j].pool, NULL);
+    }
+    vkDestroyPipelineLayout(v->device, v->layout, NULL);
+    vkDestroyDescriptorSetLayout(v->device, v->descriptors, NULL); vkDestroyDevice(v->device, NULL);
     if (v->debug) {
         PFN_vkDestroyDebugUtilsMessengerEXT destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(v->instance, "vkDestroyDebugUtilsMessengerEXT");
         destroy(v->instance, v->debug, NULL);

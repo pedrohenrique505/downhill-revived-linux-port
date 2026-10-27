@@ -120,3 +120,37 @@ while the independent rate is 109.99 (FAIL); corrected report 111.54 versus
 always reach the configured rate. All four API/synchronization window modes
 pass again. Evidence: `window-profile-final/`,
 `issue16-profile-red-green-final.log`. Timing changes do not alter rendering.
+
+## Two native submission banks (2026-10-27 continuation)
+
+The single-bank 144-Hz run also completes at official tick 23551, with two
+resizes, the normal result transition and exit 0. It measures 123.91 pictures/s
+and 53.086 game fields/s at fields 6000-6600; the corrected exit profile reports
+125.80 pictures/s. Evidence: `race144-final/`. This establishes functional
+interpolation/finish, not a sustained 144-picture performance claim.
+
+Native Vulkan now has two independently fenced command/upload/descriptor banks.
+Each has its own acquire semaphore and deferred resource list; present completion
+semaphores still belong to swapchain images. The CPU can prepare the next picture
+while the GPU finishes the previous one. Reads, resize and teardown drain both
+banks. Deferred destruction follows the latest submission that can use a resource.
+This costs one additional 64-MiB upload arena plus descriptor/command storage.
+Reference: [Khronos frames in flight](https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/03_Drawing/03_Frames_in_flight.html),
+provided by the Vulkan MCP synchronization topic consulted above.
+
+All four window modes pass API/synchronization validation. All 17 transfer/backend
+fixtures and all 23 replays (86 pictures) pass strict validation, retaining the
+previous complete RGBA hashes, readbacks and profile counters. Evidence:
+`window-banks/`, `replay-banks/`, `issue16-bank-regressions.log`.
+The ordinary Linux link completes with the same 23 stubs and no remaining
+undefined symbols (`issue16-link-banks.log`).
+
+The first two-bank smoke run was stopped at the user's request before racing;
+its harness failure is an intentional interruption, not acceptance evidence.
+On resume, an isolated 144-Hz run through GO+60 s passes resize, screenshot,
+DHD_DUMP, DHD_BENCH, DHD_TIMELINE and normal close. Same fields 6000-6600:
+**144.02 pictures/s**, 1695 interpolated pictures, **49.821 game fields/s**.
+Thus presentation reaches its target, but 60 game fields/s is not sustained in
+this measured scene on this RADV RENOIR host. No checker or tolerance changed.
+Evidence: `resume144-banks/result.json`. A final full race on the two-bank
+backend is pending below.
